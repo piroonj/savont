@@ -1,0 +1,175 @@
+{
+  "generated_at": "2026-07-25T04:05:35.569591+00:00",
+  "nodes": {
+    "alignment_align_and_consensus": {
+      "code_fingerprint": "c0645d2821519d31afc83df52453e800b6e6d72ca90ff4955dd02c515409e33a",
+      "label": "align_and_consensus()",
+      "last": "2026-07-24T23:16:11.756362+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-24T23:16:11.756362+00:00",
+          "outcome": "useful",
+          "q": "จากผลของ savont นี้ ไฟล์แต่ละไฟล์ที่อยู่ใน temp เป็นไฟล์ที่มีความหมายว่าอย่างไรบ้าง"
+        },
+        {
+          "date": "2026-07-24T03:15:19.379736+00:00",
+          "outcome": "useful",
+          "q": "เทียบการทำงาน และ process ของ การทำ allele typing ของ ont-chinook กับ savont"
+        }
+      ],
+      "score": 1.971739495,
+      "source_file": "alignment.rs",
+      "status": "preferred",
+      "uses": 2
+    },
+    "alignment_analyze_pileup_consensuses": {
+      "code_fingerprint": "c0645d2821519d31afc83df52453e800b6e6d72ca90ff4955dd02c515409e33a",
+      "label": "analyze_pileup_consensuses()",
+      "last": "2026-07-24T23:16:11.756362+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-24T23:16:11.756362+00:00",
+          "outcome": "useful",
+          "q": "จากผลของ savont นี้ ไฟล์แต่ละไฟล์ที่อยู่ใน temp เป็นไฟล์ที่มีความหมายว่าอย่างไรบ้าง"
+        }
+      ],
+      "score": 0.99536737,
+      "source_file": "alignment.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "alignment_merge_similar_consensuses": {
+      "code_fingerprint": "c0645d2821519d31afc83df52453e800b6e6d72ca90ff4955dd02c515409e33a",
+      "label": "merge_similar_consensuses()",
+      "last": "2026-07-24T23:16:11.756362+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-24T23:16:11.756362+00:00",
+          "outcome": "useful",
+          "q": "จากผลของ savont นี้ ไฟล์แต่ละไฟล์ที่อยู่ใน temp เป็นไฟล์ที่มีความหมายว่าอย่างไรบ้าง"
+        }
+      ],
+      "score": 0.99536737,
+      "source_file": "alignment.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "alignment_refine_asv_depths_with_em": {
+      "code_fingerprint": "c0645d2821519d31afc83df52453e800b6e6d72ca90ff4955dd02c515409e33a",
+      "label": "refine_asv_depths_with_em()",
+      "last": "2026-07-24T23:16:11.756362+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-24T23:16:11.756362+00:00",
+          "outcome": "useful",
+          "q": "จากผลของ savont นี้ ไฟล์แต่ละไฟล์ที่อยู่ใน temp เป็นไฟล์ที่มีความหมายว่าอย่างไรบ้าง"
+        },
+        {
+          "date": "2026-07-24T03:15:19.379736+00:00",
+          "outcome": "useful",
+          "q": "เทียบการทำงาน และ process ของ การทำ allele typing ของ ont-chinook กับ savont"
+        }
+      ],
+      "score": 1.971739495,
+      "source_file": "alignment.rs",
+      "status": "preferred",
+      "uses": 2
+    },
+    "asv_cluster_cluster_reads_by_kmers": {
+      "code_fingerprint": "10102ddb96e947ae152055f359380d4937799090e43222bd08393b6ed88f11d4",
+      "label": "cluster_reads_by_kmers()",
+      "last": "2026-07-24T23:16:11.756362+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-24T23:16:11.756362+00:00",
+          "outcome": "useful",
+          "q": "จากผลของ savont นี้ ไฟล์แต่ละไฟล์ที่อยู่ใน temp เป็นไฟล์ที่มีความหมายว่าอย่างไรบ้าง"
+        }
+      ],
+      "score": 0.99536737,
+      "source_file": "asv_cluster.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "asv_cluster_cluster_reads_by_snpmers": {
+      "code_fingerprint": "10102ddb96e947ae152055f359380d4937799090e43222bd08393b6ed88f11d4",
+      "label": "cluster_reads_by_snpmers()",
+      "last": "2026-07-24T23:16:11.756362+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-24T23:16:11.756362+00:00",
+          "outcome": "useful",
+          "q": "จากผลของ savont นี้ ไฟล์แต่ละไฟล์ที่อยู่ใน temp เป็นไฟล์ที่มีความหมายว่าอย่างไรบ้าง"
+        },
+        {
+          "date": "2026-07-24T03:15:19.379736+00:00",
+          "outcome": "useful",
+          "q": "เทียบการทำงาน และ process ของ การทำ allele typing ของ ont-chinook กับ savont"
+        }
+      ],
+      "score": 1.971739495,
+      "source_file": "asv_cluster.rs",
+      "status": "preferred",
+      "uses": 2
+    },
+    "chimera_detect_chimeras": {
+      "code_fingerprint": "84b0fdb8f00206d14115ee674fde1072e2682029c1814d5a8f8d921d4828d6dd",
+      "label": "detect_chimeras()",
+      "last": "2026-07-24T03:15:19.379736+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-24T03:15:19.379736+00:00",
+          "outcome": "useful",
+          "q": "เทียบการทำงาน และ process ของ การทำ allele typing ของ ont-chinook กับ savont"
+        }
+      ],
+      "score": 0.976372125,
+      "source_file": "chimera.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "classify_classify": {
+      "code_fingerprint": "5348614453c1ea1ee4cc78a6e3b340fcd838bf64faaa04aeb9ec7b5e899b51f4",
+      "label": "classify()",
+      "last": "2026-07-24T23:16:11.756362+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-24T23:16:11.756362+00:00",
+          "outcome": "useful",
+          "q": "จากผลของ savont นี้ ไฟล์แต่ละไฟล์ที่อยู่ใน temp เป็นไฟล์ที่มีความหมายว่าอย่างไรบ้าง"
+        },
+        {
+          "date": "2026-07-24T03:15:19.379736+00:00",
+          "outcome": "useful",
+          "q": "เทียบการทำงาน และ process ของ การทำ allele typing ของ ont-chinook กับ savont"
+        }
+      ],
+      "score": 1.971739495,
+      "source_file": "classify.rs",
+      "status": "preferred",
+      "uses": 2
+    },
+    "main_run_cluster": {
+      "code_fingerprint": "1cece906cab2451be16d61122912523bbebeb76c99b9926d34c05fec72c3b945",
+      "label": "run_cluster()",
+      "last": "2026-07-24T23:16:11.756362+00:00",
+      "provenance": [
+        {
+          "date": "2026-07-24T23:16:11.756362+00:00",
+          "outcome": "useful",
+          "q": "จากผลของ savont นี้ ไฟล์แต่ละไฟล์ที่อยู่ใน temp เป็นไฟล์ที่มีความหมายว่าอย่างไรบ้าง"
+        },
+        {
+          "date": "2026-07-24T03:15:19.379736+00:00",
+          "outcome": "useful",
+          "q": "เทียบการทำงาน และ process ของ การทำ allele typing ของ ont-chinook กับ savont"
+        }
+      ],
+      "score": 1.971739495,
+      "source_file": "main.rs",
+      "status": "preferred",
+      "uses": 2
+    }
+  },
+  "version": 1
+}
