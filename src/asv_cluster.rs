@@ -1097,6 +1097,10 @@ fn compare_consensus_snpmers(
             } else {
                 mismatches += 1;
             }
+        } else {
+            // A consensus-level anchor present on only one side is evidence
+            // that the clusters differ and must not be silently ignored.
+            mismatches += 1;
         }
     }
 
@@ -1109,7 +1113,8 @@ fn are_consensus_concordant(
     consensus2: &[ConsensusSnpmer],
 ) -> bool {
     let (matches, mismatches) = compare_consensus_snpmers(consensus1, consensus2);
-    mismatches == 0 && matches >= consensus1.len().min(consensus2.len().max(2))
+    let minimum_required_matches = consensus1.len().min(consensus2.len()).max(2);
+    mismatches == 0 && matches >= minimum_required_matches
 }
 
 fn candidate_cluster_order(
@@ -1336,10 +1341,14 @@ fn recluster_one_round_top_n(
             };
 
             let (matches, mismatches) = compare_consensus_snpmers(consensus_i, consensus_j);
+            let (_, reverse_mismatches) = compare_consensus_snpmers(consensus_j, consensus_i);
+            let no_bidirectional_mismatches = mismatches == 0 && reverse_mismatches == 0;
+            let has_sufficient_matching_evidence = matches >= 2;
             let max_len = all_clusters[i].0.len().max(all_clusters[j].0.len());
             let min_len = all_clusters[i].0.len().min(all_clusters[j].0.len());
             let _missing = consensus_i.len().min(consensus_j.len()) - matches;
-            if mismatches == 0
+            if no_bidirectional_mismatches
+                && has_sufficient_matching_evidence
                 && (matches as f64) > (consensus_i.len().min(consensus_j.len()) as f64) * 0.975
                 && max_len / min_len > 50
             {
@@ -1348,7 +1357,11 @@ fn recluster_one_round_top_n(
                 //i, j, max_len, min_len, matches, mismatches, consensus_i.len(), consensus_j.len());
             }
 
-            if mismatches == 0 && max_len / min_len > 500 && min_len <= 2 {
+            if no_bidirectional_mismatches
+                && has_sufficient_matching_evidence
+                && max_len / min_len > 500
+                && min_len <= 2
+            {
                 concordant = true;
                 //println!("Note: Clusters {} and {} potential merging due to extreme size disparity vs mismatches: max_len {}, min_len {}, matches {}, mismatches {}, cons len 1 {}, cons len 2 {}",
                 //i, j, max_len, min_len, matches, mismatches, consensus_i.len(), consensus_j.len());
@@ -1622,12 +1635,42 @@ pub fn recluster_using_consensus_reps(
 }
 
 #[cfg(test)]
-mod reassignment_tests {
-    use super::candidate_cluster_order;
+mod tests {
+    use super::{
+        are_consensus_concordant, candidate_cluster_order, compare_consensus_snpmers,
+        ConsensusSnpmer, Kmer48,
+    };
+
+    fn consensus_marker(splitmer: u64, kmer: u64) -> ConsensusSnpmer {
+        ConsensusSnpmer::new(0, splitmer, Kmer48::from_u64(kmer), 1)
+    }
 
     #[test]
     fn current_cluster_is_scored_first_to_preserve_ties() {
         let order: Vec<usize> = candidate_cluster_order(2, 4).collect();
         assert_eq!(order, vec![2, 0, 1, 3]);
+    }
+
+    #[test]
+    fn missing_consensus_anchor_is_a_mismatch() {
+        let full = vec![consensus_marker(1, 101), consensus_marker(2, 202)];
+        let subset = vec![consensus_marker(1, 101)];
+
+        assert_eq!(compare_consensus_snpmers(&full, &subset), (1, 1));
+        assert_eq!(compare_consensus_snpmers(&subset, &full), (1, 0));
+        assert!(
+            !(are_consensus_concordant(&full, &subset) && are_consensus_concordant(&subset, &full))
+        );
+    }
+
+    #[test]
+    fn concordance_requires_at_least_two_matching_markers() {
+        let empty: Vec<ConsensusSnpmer> = Vec::new();
+        let one_marker = vec![consensus_marker(1, 101)];
+        let two_markers = vec![consensus_marker(1, 101), consensus_marker(2, 202)];
+
+        assert!(!are_consensus_concordant(&empty, &empty));
+        assert!(!are_consensus_concordant(&one_marker, &one_marker));
+        assert!(are_consensus_concordant(&two_markers, &two_markers));
     }
 }
