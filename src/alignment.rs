@@ -12,6 +12,97 @@ use fxhash::{FxHashMap, FxHashSet};
 use crate::asv_cluster::find_compatible_candidates;
 use crate::kmer_comp;
 
+/// A compact, cluster-level representation of the polymorphic markers observed
+/// in Stage 3.  The splitmer identifies the marker context while the full k-mer
+/// identifies the observed allele at that marker.
+#[derive(Debug, Clone, Default)]
+struct SnpmerSignature {
+    markers: FxHashMap<u64, (Kmer48, usize)>,
+}
+
+const MIN_SIGNATURE_SUPPORT: usize = 3;
+
+fn build_snpmer_signature(cluster: &[usize], twin_reads: &[TwinRead], k: usize) -> SnpmerSignature {
+    let mask = !(3 << (k - 1));
+    let mut observations: FxHashMap<u64, FxHashMap<Kmer48, usize>> = FxHashMap::default();
+
+    for &read_id in cluster {
+        let Some(read) = twin_reads.get(read_id) else { continue };
+        for &kmer in read.snpmer_kmers() {
+            let splitmer = kmer.to_u64() & mask;
+            *observations
+                .entry(splitmer)
+                .or_default()
+                .entry(kmer)
+                .or_insert(0) += 1;
+        }
+    }
+
+    let minimum_support = (cluster.len() / 20).max(MIN_SIGNATURE_SUPPORT);
+    let markers = observations
+        .into_iter()
+        .filter_map(|(splitmer, alleles)| {
+            let (kmer, support) = alleles
+                .into_iter()
+                .max_by_key(|(_, support)| *support)?;
+            (support >= minimum_support).then_some((splitmer, (kmer, support)))
+        })
+        .collect();
+
+    SnpmerSignature { markers }
+}
+
+fn count_snpmer_conflicts(left: &SnpmerSignature, right: &SnpmerSignature) -> usize {
+    left.markers
+        .iter()
+        .filter(|(splitmer, (left_kmer, _))| {
+            right
+                .markers
+                .get(splitmer)
+                .is_some_and(|(right_kmer, _)| left_kmer != right_kmer)
+        })
+        .count()
+}
+
+fn snpmer_signatures_compatible(left: &SnpmerSignature, right: &SnpmerSignature) -> bool {
+    count_snpmer_conflicts(left, right) == 0
+}
+
+fn build_read_owners(consensuses: &[ConsensusSequence], read_count: usize) -> Vec<Option<usize>> {
+    let mut owners = vec![None; read_count];
+    for (asv_idx, consensus) in consensuses.iter().enumerate() {
+        for &read_idx in &consensus.cluster {
+            if let Some(owner) = owners.get_mut(read_idx) {
+                *owner = Some(asv_idx);
+            }
+        }
+    }
+    owners
+}
+
+#[cfg(test)]
+mod snpmer_guard_tests {
+    use super::{snpmer_signatures_compatible, SnpmerSignature};
+    use crate::types::Kmer48;
+    use fxhash::FxHashMap;
+
+    fn signature(splitmer: u64, kmer: u64) -> SnpmerSignature {
+        let mut markers = FxHashMap::default();
+        markers.insert(splitmer, (Kmer48::from_u64(kmer), 10));
+        SnpmerSignature { markers }
+    }
+
+    #[test]
+    fn accepts_signatures_without_conflicts() {
+        assert!(snpmer_signatures_compatible(&signature(1, 11), &signature(1, 11)));
+    }
+
+    #[test]
+    fn rejects_different_alleles_at_same_splitmer() {
+        assert!(!snpmer_signatures_compatible(&signature(1, 11), &signature(1, 12)));
+    }
+}
+
 /// Represents a base in the pileup at a reference position
 #[derive(Debug, Clone)]
 pub enum PileupBase {
@@ -1335,11 +1426,19 @@ fn lq_criteria(consensus: &ConsensusSequence, args: &Cli) -> bool {
     (consensus.depth / ((consensus.low_quality_positions.len() * consensus.low_quality_positions.len())) < args.n_depth_cutoff)
 }
 
-fn remove_similar_seqs_kmers(mut consensuses: Vec<ConsensusSequence>) -> Vec<ConsensusSequence> {
+fn remove_similar_seqs_kmers(
+    mut consensuses: Vec<ConsensusSequence>,
+    twin_reads: &[TwinRead],
+    k: usize,
+) -> Vec<ConsensusSequence> {
     let mut kmer_index = std::collections::HashMap::new();
     let mut filtered_consensuses: Vec<ConsensusSequence> = Vec::new();
     let mut consensus_id_to_minis = std::collections::HashMap::new();
     let adapter_buffer = 25;
+    let snpmer_signatures: Vec<SnpmerSignature> = consensuses
+        .iter()
+        .map(|consensus| build_snpmer_signature(&consensus.cluster, twin_reads, k))
+        .collect();
 
     for (i, consensus) in consensuses.iter().enumerate() {
         if consensus.sequence.len() < 100{
@@ -1361,7 +1460,12 @@ fn remove_similar_seqs_kmers(mut consensuses: Vec<ConsensusSequence>) -> Vec<Con
             if first{
                 if let Some(ids) = kmer_index.get(mini) {
                     for id in ids {
-                        if consensuses[*id].depth / 2 > consensuses[enum_id].depth {
+                        if consensuses[*id].depth / 2 > consensuses[enum_id].depth
+                            && snpmer_signatures_compatible(
+                                &snpmer_signatures[*id],
+                                &snpmer_signatures[enum_id],
+                            )
+                        {
                             possible_greater_ids.insert(*id);
                         }
                     }
@@ -1401,8 +1505,18 @@ pub fn merge_similar_consensuses(
     // Look at [35,length-35] bases to avoid adapters. Take all k-mers. Remove subsetted reads at lower depth.
     log::info!("Removing duplicate consensus sequences based on k-mer similarity");
     let prev_size = consensuses.len();
-    let consensuses = remove_similar_seqs_kmers(consensuses);
+    let consensuses = remove_similar_seqs_kmers(consensuses, twin_reads, args.kmer_size);
     log::info!("Reduced consensus sequences from {} to {} after k-mer based deduplication", prev_size, consensuses.len());
+
+    let snpmer_signatures: Vec<SnpmerSignature> = consensuses
+        .iter()
+        .map(|consensus| build_snpmer_signature(&consensus.cluster, twin_reads, args.kmer_size))
+        .collect();
+    let low_quality_snpmer_signatures: Vec<SnpmerSignature> = low_qual_consensuses
+        .iter()
+        .map(|consensus| build_snpmer_signature(&consensus.cluster, twin_reads, args.kmer_size))
+        .collect();
+    let snpmer_rejections: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 
     // Write polished consensus sequences to FASTA for indexing
     let output_fasta_path = temp_dir.join("polished_consensuses.fasta");
@@ -1446,6 +1560,18 @@ pub fn merge_similar_consensuses(
 
                     if alignment.nm > 10 {
                         return; // Skip high error alignments
+                    }
+
+                    let conflicts = count_snpmer_conflicts(
+                        &low_quality_snpmer_signatures[low_qual_idx],
+                        &snpmer_signatures[target_idx],
+                    );
+                    if conflicts > 0 {
+                        snpmer_rejections
+                            .lock()
+                            .unwrap()
+                            .push((low_qual_consensus.id, consensuses[target_idx].id, conflicts));
+                        return;
                     }
 
                     log::debug!("Low quality consensus {} (id={}, depth={}) maps to consensus {} (depth = {}) with NM={}",
@@ -1533,6 +1659,18 @@ pub fn merge_similar_consensuses(
                             consensuses[query_idx].id, consensuses[query_idx].depth, consensuses[target_idx].id, consensuses[target_idx].depth, adjusted_errors);
                     }
 
+                    let conflicts = count_snpmer_conflicts(
+                        &snpmer_signatures[query_idx],
+                        &snpmer_signatures[target_idx],
+                    );
+                    if conflicts > 0 {
+                        snpmer_rejections
+                            .lock()
+                            .unwrap()
+                            .push((consensuses[query_idx].id, target_consensus.id, conflicts));
+                        continue;
+                    }
+
                     mappings.lock().unwrap().push((
                         query_idx,
                         target_idx,
@@ -1545,6 +1683,25 @@ pub fn merge_similar_consensuses(
     });
 
     let mappings = mappings.into_inner().unwrap();
+    let snpmer_rejections = snpmer_rejections.into_inner().unwrap();
+    if !snpmer_rejections.is_empty() {
+        let rejection_file = temp_dir.join("snpmer_merge_rejections.tsv");
+        let mut writer = std::io::BufWriter::new(
+            std::fs::File::create(&rejection_file)
+                .expect("Failed to create snpmer_merge_rejections.tsv"),
+        );
+        writeln!(writer, "query_consensus\ttarget_consensus\tconflicting_splitmers")
+            .expect("Failed to write snpmer_merge_rejections.tsv header");
+        for (query_id, target_id, conflicts) in &snpmer_rejections {
+            writeln!(writer, "{}\t{}\t{}", query_id, target_id, conflicts)
+                .expect("Failed to write snpmer_merge_rejections.tsv");
+        }
+        log::info!(
+            "SNPmer guard rejected {} consensus merge candidates; wrote {}",
+            snpmer_rejections.len(),
+            rejection_file.display()
+        );
+    }
 
     // For each query consensus, find the best target (highest depth) to merge with
     let mut merge_map: HashMap<usize, usize> = HashMap::new(); // query_idx -> target_idx
@@ -1712,6 +1869,7 @@ fn finalize_read_assignments(
     assignments: Vec<ReadEquivalence>,
     abundances: &[f64],
     total_assigned: usize,
+    read_owners: &[Option<usize>],
     temp_dir: &PathBuf,
 ) {
     for consensus in consensuses.iter_mut() {
@@ -1729,10 +1887,20 @@ fn finalize_read_assignments(
         candidates.sort_unstable();
         candidates.dedup();
 
+        let had_candidates = !candidates.is_empty();
+        if let Some(owner) = read_owners.get(read_idx).copied().flatten() {
+            candidates.retain(|&candidate| candidate == owner);
+        }
+
         if candidates.is_empty() {
+            let status = if had_candidates {
+                "filtered_cluster_guard"
+            } else {
+                "filtered"
+            };
             rows.push(format!(
-                "{}\t{}\tfiltered\t.\t.\t{}\t0.000000\t0.000000\t0.000",
-                read_idx, twin_reads[read_idx].id, best_nm
+                "{}\t{}\t{}\t.\t.\t{}\t0.000000\t0.000000\t0.000",
+                read_idx, twin_reads[read_idx].id, status, best_nm
             ));
             continue;
         }
@@ -1819,6 +1987,7 @@ fn refine_asv_depths_with_minimap2(
     twin_reads: &[TwinRead],
     consensuses: &mut Vec<ConsensusSequence>,
     args: &Cli,
+    read_owners: &[Option<usize>],
     temp_dir: &PathBuf,
 ) {
     if consensuses.is_empty() {
@@ -1851,6 +2020,7 @@ fn refine_asv_depths_with_minimap2(
 
     let eq_classes: Mutex<HashMap<EquivalenceClass, usize>> = Mutex::new(HashMap::new());
     let filtered_reads_count = Mutex::new(0usize);
+    let cluster_guard_filtered_count = Mutex::new(0usize);
     let total_assigned_reads = Mutex::new(0usize);
     let read_assignments: Mutex<Vec<ReadEquivalence>> = Mutex::new(Vec::new());
 
@@ -1896,6 +2066,19 @@ fn refine_asv_depths_with_minimap2(
         best_asv_indices.sort();
         best_asv_indices.dedup();
 
+        if let Some(owner) = read_owners.get(read_idx).copied().flatten() {
+            best_asv_indices.retain(|&asv_idx| asv_idx == owner);
+            if best_asv_indices.is_empty() {
+                read_assignments
+                    .lock()
+                    .unwrap()
+                    .push((read_idx, Vec::new(), best_nm));
+                *filtered_reads_count.lock().unwrap() += 1;
+                *cluster_guard_filtered_count.lock().unwrap() += 1;
+                return;
+            }
+        }
+
         {
             let mut writer = mapping_file_writer.lock().unwrap();
             for &asv_idx in &best_asv_indices {
@@ -1931,10 +2114,12 @@ fn refine_asv_depths_with_minimap2(
 
     let eq_classes = eq_classes.into_inner().unwrap();
     let filtered_reads = filtered_reads_count.into_inner().unwrap();
+    let cluster_guard_filtered = cluster_guard_filtered_count.into_inner().unwrap();
     let total_assigned = total_assigned_reads.into_inner().unwrap();
     let read_assignments = read_assignments.into_inner().unwrap();
 
     log::info!("Filtered {} reads with no valid minimap2 mapping", filtered_reads);
+    log::info!("Cluster ownership guard filtered {} minimap2 assignments", cluster_guard_filtered);
     log::info!("Total assigned reads: {}", total_assigned);
     log::info!("Total percentage assigned: {:.2}%",
         (total_assigned as f64 / (total_assigned + filtered_reads) as f64) * 100.0);
@@ -1957,6 +2142,7 @@ fn refine_asv_depths_with_minimap2(
             read_assignments,
             &zero_abundances,
             total_assigned,
+            read_owners,
             temp_dir,
         );
         return;
@@ -2026,6 +2212,7 @@ fn refine_asv_depths_with_minimap2(
         read_assignments,
         &asv_abundances,
         total_assigned,
+        read_owners,
         temp_dir,
     );
 
@@ -2047,8 +2234,15 @@ pub fn refine_asv_depths_with_em(
     args: &Cli,
     temp_dir: &PathBuf,
 ) {
+    let read_owners = build_read_owners(consensuses, twin_reads.len());
     if args.low_polymorphism {
-        return refine_asv_depths_with_minimap2(twin_reads, consensuses, args, temp_dir);
+        return refine_asv_depths_with_minimap2(
+            twin_reads,
+            consensuses,
+            args,
+            &read_owners,
+            temp_dir,
+        );
     }
 
     if consensuses.is_empty() {
@@ -2090,6 +2284,7 @@ pub fn refine_asv_depths_with_em(
     // Step 3: Map all reads to ASVs using k-mer comparison and collect equivalence classes
     let eq_classes = Mutex::new(HashMap::new());
     let filtered_reads_count = Mutex::new(0usize);
+    let cluster_guard_filtered_count = Mutex::new(0usize);
     let total_assigned_reads = Mutex::new(0usize);
     let read_assignments: Mutex<Vec<ReadEquivalence>> = Mutex::new(Vec::new());
 
@@ -2170,6 +2365,19 @@ pub fn refine_asv_depths_with_em(
         best_asv_indices.sort_by(|a, b| a.1.cmp(&b.1)); // Sort by mismatches
         let lowest_mismatches = best_asv_indices[0].1;
         best_asv_indices.retain(|(_, mismatches)| *mismatches == lowest_mismatches);
+
+        if let Some(owner) = read_owners.get(read_idx).copied().flatten() {
+            best_asv_indices.retain(|(asv_idx, _)| *asv_idx == owner);
+            if best_asv_indices.is_empty() {
+                read_assignments
+                    .lock()
+                    .unwrap()
+                    .push((read_idx, Vec::new(), i32::MAX));
+                *filtered_reads_count.lock().unwrap() += 1;
+                *cluster_guard_filtered_count.lock().unwrap() += 1;
+                return;
+            }
+        }
 
         // For each best ASV, count number of kmer matches for tie-breaking
         let mut best_alns: Vec<(usize, i32, usize)> = Vec::new(); // (asv_idx, nm, mismatches)
@@ -2265,10 +2473,12 @@ pub fn refine_asv_depths_with_em(
 
     let eq_classes = eq_classes.into_inner().unwrap();
     let filtered_reads = filtered_reads_count.into_inner().unwrap();
+    let cluster_guard_filtered = cluster_guard_filtered_count.into_inner().unwrap();
     let total_assigned = total_assigned_reads.into_inner().unwrap();
     let read_assignments = read_assignments.into_inner().unwrap();
 
     log::info!("Filtered {} reads with ratio > 0.005", filtered_reads);
+    log::info!("Cluster ownership guard filtered {} SNPmer assignments", cluster_guard_filtered);
     log::info!("Total assigned reads: {}", total_assigned);
     log::info!("Total percentage assigned: {:.2}%", (total_assigned as f64 / (total_assigned + filtered_reads) as f64) * 100.0);
     log::info!("Number of unique equivalence classes: {}", eq_classes.len());
@@ -2298,6 +2508,7 @@ pub fn refine_asv_depths_with_em(
             read_assignments,
             &zero_abundances,
             total_assigned,
+            &read_owners,
             temp_dir,
         );
         return;
@@ -2381,6 +2592,7 @@ pub fn refine_asv_depths_with_em(
         read_assignments,
         &asv_abundances,
         total_assigned,
+        &read_owners,
         temp_dir,
     );
 
