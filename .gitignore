@@ -1,3 +1,4 @@
+src/graphify-out/
 target/
 tests/data/emu-1
 tests/data/greengenes2-2024.09
