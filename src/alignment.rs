@@ -35,6 +35,95 @@ pub struct Pileup {
     pub alt_posterior: Option<f64>,
 }
 
+/// Robust read-length profile used to detect consensus sequences that are
+/// implausibly longer than the reads that generated them.
+#[derive(Debug, Clone, Copy)]
+pub struct ConsensusLengthProfile {
+    pub median_length: usize,
+    pub mad_length: usize,
+    pub maximum_expected_length: usize,
+}
+
+/// Estimate a per-run consensus length ceiling from the reads that reached
+/// Savont clustering. The median is robust to a small number of outliers and
+/// the MAD adapts the margin when read lengths are naturally variable.
+pub fn estimate_consensus_length_profile(
+    twin_reads: &[TwinRead],
+    tolerance: f64,
+    use_hpc: bool,
+) -> ConsensusLengthProfile {
+    let lengths: Vec<usize> = twin_reads
+        .iter()
+        .map(|read| {
+            if use_hpc {
+                let sequence: Vec<u8> = read
+                    .dna_seq
+                    .iter()
+                    .map(|base| base.to_char().to_ascii_uppercase() as u8)
+                    .collect();
+                utils::homopolymer_compress(&sequence, true).0.len()
+            } else {
+                read.dna_seq.len()
+            }
+        })
+        .collect();
+    estimate_consensus_length_profile_from_lengths(lengths, tolerance)
+}
+
+fn estimate_consensus_length_profile_from_lengths(
+    mut lengths: Vec<usize>,
+    tolerance: f64,
+) -> ConsensusLengthProfile {
+    if lengths.is_empty() {
+        return ConsensusLengthProfile {
+            median_length: 0,
+            mad_length: 0,
+            maximum_expected_length: 0,
+        };
+    }
+
+    lengths.sort_unstable();
+    let median_length = lengths[lengths.len() / 2];
+    let mut deviations: Vec<usize> = lengths
+        .iter()
+        .map(|length| length.abs_diff(median_length))
+        .collect();
+    deviations.sort_unstable();
+    let mad_length = deviations[deviations.len() / 2];
+
+    let fractional_margin = ((median_length as f64) * tolerance.max(0.0)).ceil() as usize;
+    let adaptive_margin = mad_length.saturating_mul(3);
+    let margin = fractional_margin.max(adaptive_margin).max(1);
+
+    ConsensusLengthProfile {
+        median_length,
+        mad_length,
+        maximum_expected_length: median_length.saturating_add(margin),
+    }
+}
+
+#[cfg(test)]
+mod consensus_length_tests {
+    use super::estimate_consensus_length_profile_from_lengths;
+
+    #[test]
+    fn estimates_a_run_specific_upper_bound() {
+        let profile = estimate_consensus_length_profile_from_lengths(
+            vec![5_000, 5_010, 5_020, 5_030, 5_040],
+            0.10,
+        );
+        assert_eq!(profile.median_length, 5_020);
+        assert_eq!(profile.mad_length, 10);
+        assert_eq!(profile.maximum_expected_length, 5_522);
+    }
+
+    #[test]
+    fn empty_input_has_no_length_ceiling() {
+        let profile = estimate_consensus_length_profile_from_lengths(Vec::new(), 0.10);
+        assert_eq!(profile.maximum_expected_length, 0);
+    }
+}
+
 impl Pileup {
     pub fn new(ref_pos: usize, ref_base: u8, ref_hp_length: u8) -> Self {
         Self {
@@ -215,8 +304,17 @@ fn generate_consensus_poa(
     return consensus.into_bytes();
 }
 
-pub fn align_and_consensus(twin_reads: &[TwinRead], clusters: Vec<Vec<usize>>, args: &Cli, output_dir: &PathBuf) -> Vec<ConsensusSequence> {
+pub fn align_and_consensus(
+    twin_reads: &[TwinRead],
+    clusters: Vec<Vec<usize>>,
+    args: &Cli,
+    output_dir: &PathBuf,
+    length_profile: ConsensusLengthProfile,
+) -> Vec<ConsensusSequence> {
     let max_seqs_consensus = 75;
+    const MIN_QUERY_COVERAGE: f64 = 0.90;
+    const MIN_TARGET_COVERAGE: f64 = 0.85;
+    let length_qc_rows = Mutex::new(Vec::<String>::new());
 
     // Log which POA implementation is being used
     log::info!("Generating consensus sequences from SNPmer clusters...");
@@ -325,25 +423,51 @@ pub fn align_and_consensus(twin_reads: &[TwinRead], clusters: Vec<Vec<usize>>, a
 
             let final_seq;
             let final_qual;
-            let _qstart;
-            let _qend;
+            let qstart;
+            let qend;
             if best_mapping.strand == minimap2::Strand::Reverse {
-                _qstart = sequences[i].len() as i32 - best_mapping.query_end;
-                _qend = sequences[i].len() as i32 - best_mapping.query_start;
+                qstart = sequences[i].len() as i32 - best_mapping.query_end;
+                qend = sequences[i].len() as i32 - best_mapping.query_start;
                 final_seq = utils::reverse_complement(&sequences[i]);
                 final_qual = qualities[i].iter().rev().cloned().collect();
             }
             else{
-                _qstart = best_mapping.query_start;
-                _qend = best_mapping.query_end;
+                qstart = best_mapping.query_start;
+                qend = best_mapping.query_end;
                 final_seq = sequences[i].clone();
                 final_qual = qualities[i].clone();
             }
 
-            //let mapped_seq = final_seq[qstart as usize..qend as usize].to_vec();
-            //let mapped_qual = final_qual[qstart as usize..qend as usize].to_vec();
-            let mapped_seq = final_seq;
-            let mapped_qual = final_qual;
+            let query_span = qend.saturating_sub(qstart) as usize;
+            let query_coverage = query_span as f64 / sequences[i].len().max(1) as f64;
+            let target_span = best_mapping
+                .target_end
+                .saturating_sub(best_mapping.target_start) as usize;
+            let target_coverage = target_span as f64
+                / sequences[largest_sequence_index].len().max(1) as f64;
+            if query_coverage < MIN_QUERY_COVERAGE || target_coverage < MIN_TARGET_COVERAGE {
+                log::debug!(
+                    "Skipping read {} in cluster {}: query coverage {:.3}, target coverage {:.3}",
+                    i, cluster_idx, query_coverage, target_coverage
+                );
+                continue;
+            }
+
+            // Only pass the aligned query segment to POA. Including unaligned
+            // tails allows overlap alignment to concatenate incompatible
+            // amplicon segments into an overlong consensus.
+            if qstart < 0 || qend <= qstart {
+                log::debug!("Skipping invalid aligned coordinates for read {} in cluster {}", i, cluster_idx);
+                continue;
+            }
+            let qstart = qstart as usize;
+            let qend = (qend as usize).min(final_seq.len());
+            if qstart >= qend || qend > final_seq.len() || qend > final_qual.len() {
+                log::debug!("Skipping invalid aligned segment for read {} in cluster {}", i, cluster_idx);
+                continue;
+            }
+            let mapped_seq = final_seq[qstart..qend].to_vec();
+            let mapped_qual = final_qual[qstart..qend].to_vec();
 
             aligned_sequences.push(mapped_seq);
             aligned_qualities.push(mapped_qual);
@@ -374,6 +498,48 @@ pub fn align_and_consensus(twin_reads: &[TwinRead], clusters: Vec<Vec<usize>>, a
 
         // Compress the consensus again to ensure it's fully HPC
         let (hpc_consensus_seq, _) = utils::homopolymer_compress(&hpc_consensus, args.use_hpc);
+        let cluster_read_ids = cluster
+            .iter()
+            .map(|read_id| read_id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        if length_profile.maximum_expected_length > 0
+            && hpc_consensus_seq.len() > length_profile.maximum_expected_length
+        {
+            length_qc_rows.lock().unwrap().push(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                cluster_idx,
+                cluster.len(),
+                hpc_consensus_seq.len(),
+                length_profile.median_length,
+                length_profile.mad_length,
+                length_profile.maximum_expected_length,
+                "rejected_length",
+                cluster_read_ids,
+            ));
+            log::warn!(
+                "Rejecting consensus for cluster {}: length {} exceeds expected maximum {} (median read length {}, MAD {})",
+                cluster_idx,
+                hpc_consensus_seq.len(),
+                length_profile.maximum_expected_length,
+                length_profile.median_length,
+                length_profile.mad_length,
+            );
+            return;
+        }
+
+        length_qc_rows.lock().unwrap().push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            cluster_idx,
+            cluster.len(),
+            hpc_consensus_seq.len(),
+            length_profile.median_length,
+            length_profile.mad_length,
+            length_profile.maximum_expected_length,
+            "accepted",
+            cluster_read_ids,
+        ));
 
         let buffer = 20;
         if hpc_consensus_seq.len() < 2 * buffer {
@@ -392,6 +558,23 @@ pub fn align_and_consensus(twin_reads: &[TwinRead], clusters: Vec<Vec<usize>>, a
     });
 
     let mut consensus_seqs = consensus_seqs.into_inner().unwrap();
+    let mut length_qc_rows = length_qc_rows.into_inner().unwrap();
+    length_qc_rows.sort_unstable();
+    let length_qc_path = output_dir.join("consensus_length_qc.tsv");
+    let mut length_qc_writer = std::io::BufWriter::new(
+        std::fs::File::create(&length_qc_path)
+            .expect("Failed to create consensus_length_qc.tsv"),
+    );
+    writeln!(
+        length_qc_writer,
+        "cluster_id\tread_count\tconsensus_length\tmedian_read_length\tmad_read_length\tmaximum_expected_length\tstatus\tread_ids"
+    )
+    .expect("Failed to write consensus_length_qc.tsv header");
+    for row in length_qc_rows {
+        writeln!(length_qc_writer, "{}", row).expect("Failed to write consensus_length_qc.tsv");
+    }
+    log::info!("Wrote consensus length QC information to {}", length_qc_path.display());
+
     consensus_seqs.sort_by_key(|k| (k.3) as i64 * -1);
     let consensus_seqs: Vec<ConsensusSequence> = consensus_seqs.into_iter().map(|(id, seq, hp_lens, depth, cluster)| ConsensusSequence::new(seq, hp_lens, depth, id, cluster)).collect();
 

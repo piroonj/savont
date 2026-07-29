@@ -91,6 +91,10 @@ pub struct ClusterArgs {
     #[arg(short = 'M', long, default_value = "2000", help_heading = CLI_HEADINGS[0])]
     pub max_read_length: usize,
 
+    /// Fractional margin above the observed median read length allowed for a consensus
+    #[arg(long, default_value_t = 0.10, help_heading = CLI_HEADINGS[3])]
+    pub consensus_length_tolerance: f64,
+
     /// Minimum estimated read accuracy (%) to include in clustering
     #[arg(long, default_value_t=98., help_heading = CLI_HEADINGS[0])]
     pub quality_value_cutoff: f64,

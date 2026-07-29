@@ -58,6 +58,10 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
     log::info!("Created temp directory for intermediate files: {}", temp_dir.display());
 
     log::info!("=== SAVONT STARTED: Generating ASVs ===");
+    if !args.consensus_length_tolerance.is_finite() || args.consensus_length_tolerance < 0.0 {
+        log::error!("--consensus-length-tolerance must be a finite non-negative number");
+        std::process::exit(1);
+    }
     log::info!("=== STAGE 1: Processing k-mers and polymorphic markers ===");
 
     // Step 1: Process k-mers, count k-mers, and get SNPmers
@@ -79,6 +83,19 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
     }
     let args = args; // make immutable after setup
 
+    let length_profile = alignment::estimate_consensus_length_profile(
+        &twin_reads,
+        args.consensus_length_tolerance,
+        args.use_hpc,
+    );
+    log::info!(
+        "Read length profile: n={}, median={}, MAD={}, maximum expected consensus length={}",
+        twin_reads.len(),
+        length_profile.median_length,
+        length_profile.mad_length,
+        length_profile.maximum_expected_length,
+    );
+
     log::info!("=== STAGE 2: Clustering reads by k-mers ===");
     let clusters = asv_cluster::cluster_reads_by_kmers(&twin_reads, &args, &temp_dir);
     log_memory_usage(true, "STAGE 2 DONE: Clustered reads by k-mers");
@@ -88,7 +105,13 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
     log_memory_usage(true, "STAGE 3 DONE: Clustered reads by polymorphic markers");
 
     log::info!("=== STAGE 4: Generating consensus sequences and analyzing pileupes ===");
-    let mut consensuses = alignment::align_and_consensus(&twin_reads, clusters, &args, &temp_dir);
+    let mut consensuses = alignment::align_and_consensus(
+        &twin_reads,
+        clusters,
+        &args,
+        &temp_dir,
+        length_profile,
+    );
     // Generate pileups for quality estimation
     let pileups = alignment::generate_consensus_pileups(&twin_reads, &mut consensuses, &args);
 
