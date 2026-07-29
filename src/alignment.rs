@@ -1698,6 +1698,121 @@ struct EquivalenceClass {
     asv_indices: Vec<usize>,
 }
 
+/// Read-level mapping collected before EM. An empty candidate list means that
+/// the read was filtered and cannot be assigned to a final ASV.
+type ReadEquivalence = (usize, Vec<usize>, i32);
+
+/// Convert EM equivalence classes into one reproducible hard assignment per
+/// read, rebuild consensus clusters from those assignments, and write an
+/// auditable read-level table. Ambiguous reads are assigned to the ASV with
+/// the highest final EM posterior among their candidate ASVs.
+fn finalize_read_assignments(
+    twin_reads: &[TwinRead],
+    consensuses: &mut [ConsensusSequence],
+    assignments: Vec<ReadEquivalence>,
+    abundances: &[f64],
+    total_assigned: usize,
+    temp_dir: &PathBuf,
+) {
+    for consensus in consensuses.iter_mut() {
+        consensus.cluster.clear();
+        // Depth will be replaced by the exact hard-assignment count below.
+        // Keeping appended_depth would double count reads already assigned by EM.
+        consensus.appended_depth = 0;
+    }
+
+    let mut rows = Vec::with_capacity(twin_reads.len());
+    let mut sorted_assignments = assignments;
+    sorted_assignments.sort_by_key(|(read_idx, _, _)| *read_idx);
+
+    for (read_idx, mut candidates, best_nm) in sorted_assignments {
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        if candidates.is_empty() {
+            rows.push(format!(
+                "{}\t{}\tfiltered\t.\t.\t{}\t0.000000\t0.000000\t0.000",
+                read_idx, twin_reads[read_idx].id, best_nm
+            ));
+            continue;
+        }
+
+        let denominator: f64 = candidates
+            .iter()
+            .filter_map(|&asv_idx| abundances.get(asv_idx).copied())
+            .sum();
+        let (assigned_asv, posterior) = candidates
+            .iter()
+            .filter_map(|&asv_idx| {
+                let abundance = abundances.get(asv_idx).copied()?;
+                let posterior = if denominator > 0.0 {
+                    abundance / denominator
+                } else {
+                    0.0
+                };
+                Some((asv_idx, posterior))
+            })
+            .max_by(|(left_idx, left_posterior), (right_idx, right_posterior)| {
+                left_posterior
+                    .total_cmp(right_posterior)
+                    .then_with(|| right_idx.cmp(left_idx))
+            })
+            .expect("Read assignment contains no valid ASV index");
+
+        let status = if candidates.len() == 1 {
+            "assigned_unambiguous"
+        } else {
+            "assigned_em"
+        };
+        let em_abundance = abundances.get(assigned_asv).copied().unwrap_or(0.0);
+        let em_depth = em_abundance * total_assigned as f64;
+        consensuses[assigned_asv].cluster.push(read_idx);
+
+        let candidate_ids = candidates
+            .iter()
+            .map(|&asv_idx| consensuses[asv_idx].id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        rows.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.3}",
+            read_idx,
+            twin_reads[read_idx].id,
+            status,
+            consensuses[assigned_asv].id,
+            candidate_ids,
+            best_nm,
+            posterior,
+            em_abundance,
+            em_depth,
+        ));
+    }
+
+    for consensus in consensuses.iter_mut() {
+        consensus.depth = consensus.cluster.len();
+        consensus.cluster.sort_unstable();
+    }
+
+    let output_path = temp_dir.join("read_to_asv_assignments.tsv");
+    let mut writer = std::io::BufWriter::new(
+        std::fs::File::create(&output_path)
+            .expect("Failed to create read_to_asv_assignments.tsv"),
+    );
+    writeln!(
+        writer,
+        "read_index\tread_id\tstatus\tassigned_asv\tcandidate_asvs\tbest_nm\tassignment_posterior\tem_abundance\tem_estimated_depth"
+    )
+    .expect("Failed to write read_to_asv_assignments.tsv header");
+    for row in rows {
+        writeln!(writer, "{}", row).expect("Failed to write read_to_asv_assignments.tsv");
+    }
+    log::info!(
+        "Wrote {} read-level assignments to {} (EM assigned reads: {})",
+        twin_reads.len(),
+        output_path.display(),
+        total_assigned
+    );
+}
+
 /// Refine ASV depths using minimap2 all-vs-all mapping (used in low-polymorphism mode).
 /// Skips the SNPmer index entirely; maps every read to the ASV FASTA with minimap2.
 fn refine_asv_depths_with_minimap2(
@@ -1737,6 +1852,7 @@ fn refine_asv_depths_with_minimap2(
     let eq_classes: Mutex<HashMap<EquivalenceClass, usize>> = Mutex::new(HashMap::new());
     let filtered_reads_count = Mutex::new(0usize);
     let total_assigned_reads = Mutex::new(0usize);
+    let read_assignments: Mutex<Vec<ReadEquivalence>> = Mutex::new(Vec::new());
 
     for cons in consensuses.iter_mut() {
         cons.unambig_best_read_map_count = Some(0);
@@ -1748,7 +1864,7 @@ fn refine_asv_depths_with_minimap2(
     let ambig_read_map_count = Mutex::new(vec![0usize; consensuses.len()]);
     let num_map_leq_10nm = Mutex::new(vec![0usize; consensuses.len()]);
 
-    twin_reads.par_iter().for_each(|twin_read| {
+    twin_reads.par_iter().enumerate().for_each(|(read_idx, twin_read)| {
         let seq: Vec<u8> = twin_read.dna_seq.iter().map(|x| x.to_char().to_ascii_uppercase() as u8).collect();
         let mappings = aligner.map(&seq, true, false, None, None, None).unwrap_or_default();
 
@@ -1758,6 +1874,10 @@ fn refine_asv_depths_with_minimap2(
             .collect();
 
         if valid.is_empty() {
+            read_assignments
+                .lock()
+                .unwrap()
+                .push((read_idx, Vec::new(), i32::MAX));
             *filtered_reads_count.lock().unwrap() += 1;
             return;
         }
@@ -1800,6 +1920,11 @@ fn refine_asv_depths_with_minimap2(
         }
 
         let eq_class = EquivalenceClass { asv_indices: best_asv_indices };
+        read_assignments.lock().unwrap().push((
+            read_idx,
+            eq_class.asv_indices.clone(),
+            best_nm,
+        ));
         *eq_classes.lock().unwrap().entry(eq_class).or_insert(0) += 1;
         *total_assigned_reads.lock().unwrap() += 1;
     });
@@ -1807,6 +1932,7 @@ fn refine_asv_depths_with_minimap2(
     let eq_classes = eq_classes.into_inner().unwrap();
     let filtered_reads = filtered_reads_count.into_inner().unwrap();
     let total_assigned = total_assigned_reads.into_inner().unwrap();
+    let read_assignments = read_assignments.into_inner().unwrap();
 
     log::info!("Filtered {} reads with no valid minimap2 mapping", filtered_reads);
     log::info!("Total assigned reads: {}", total_assigned);
@@ -1824,6 +1950,15 @@ fn refine_asv_depths_with_minimap2(
 
     if eq_classes.is_empty() {
         log::warn!("No reads mapped to any ASV (minimap2 path). Keeping original depths.");
+        let zero_abundances = vec![0.0; consensuses.len()];
+        finalize_read_assignments(
+            twin_reads,
+            consensuses,
+            read_assignments,
+            &zero_abundances,
+            total_assigned,
+            temp_dir,
+        );
         return;
     }
 
@@ -1884,6 +2019,15 @@ fn refine_asv_depths_with_minimap2(
         }
         consensus.depth = new_depth;
     }
+
+    finalize_read_assignments(
+        twin_reads,
+        consensuses,
+        read_assignments,
+        &asv_abundances,
+        total_assigned,
+        temp_dir,
+    );
 
     let original_count = consensuses.len();
     consensuses.retain(|c| c.depth > 0);
@@ -1947,6 +2091,7 @@ pub fn refine_asv_depths_with_em(
     let eq_classes = Mutex::new(HashMap::new());
     let filtered_reads_count = Mutex::new(0usize);
     let total_assigned_reads = Mutex::new(0usize);
+    let read_assignments: Mutex<Vec<ReadEquivalence>> = Mutex::new(Vec::new());
 
     // Step 4: populate consensus seqs
     for cons in consensuses.iter_mut() {
@@ -1959,7 +2104,7 @@ pub fn refine_asv_depths_with_em(
     let ambig_read_map_count = Mutex::new(vec![0usize; consensuses.len()]);
     let num_map_leq_10nm = Mutex::new(vec![0usize; consensuses.len()]);
 
-    twin_reads.par_iter().enumerate().for_each(|(_read_idx, twin_read)| {
+    twin_reads.par_iter().enumerate().for_each(|(read_idx, twin_read)| {
         let read_snpmers = twin_read.snpmer_kmers();
         let read_minimizers: FxHashSet<Kmer48> = twin_read.minimizer_kmers().into_iter().cloned().collect();
 
@@ -1991,6 +2136,10 @@ pub fn refine_asv_depths_with_em(
 
         // Find minimum ratio (best matches)
         if asv_scores.is_empty() {
+            read_assignments
+                .lock()
+                .unwrap()
+                .push((read_idx, Vec::new(), i32::MAX));
             *filtered_reads_count.lock().unwrap() += 1;
             return;
         }
@@ -2009,6 +2158,10 @@ pub fn refine_asv_depths_with_em(
             .collect();
 
         if best_asv_indices.is_empty() {
+            read_assignments
+                .lock()
+                .unwrap()
+                .push((read_idx, Vec::new(), i32::MAX));
             *filtered_reads_count.lock().unwrap() += 1;
             return;
         }
@@ -2092,11 +2245,20 @@ pub fn refine_asv_depths_with_em(
             }
 
             // Add to equivalence class with count
+            read_assignments.lock().unwrap().push((
+                read_idx,
+                eq_class.asv_indices.clone(),
+                best_nm,
+            ));
             let mut eq_map = eq_classes.lock().unwrap();
             *eq_map.entry(eq_class).or_insert(0) += 1;
             *total_assigned_reads.lock().unwrap() += 1;
         } else {
             log::trace!("Read filtered out due to high ratio mappings: ratio {:.4} mismatch {} mini {}", min_ratio, min_mismatches, max_mini);
+            read_assignments
+                .lock()
+                .unwrap()
+                .push((read_idx, Vec::new(), i32::MAX));
             *filtered_reads_count.lock().unwrap() += 1;
         }
     });
@@ -2104,6 +2266,7 @@ pub fn refine_asv_depths_with_em(
     let eq_classes = eq_classes.into_inner().unwrap();
     let filtered_reads = filtered_reads_count.into_inner().unwrap();
     let total_assigned = total_assigned_reads.into_inner().unwrap();
+    let read_assignments = read_assignments.into_inner().unwrap();
 
     log::info!("Filtered {} reads with ratio > 0.005", filtered_reads);
     log::info!("Total assigned reads: {}", total_assigned);
@@ -2128,6 +2291,15 @@ pub fn refine_asv_depths_with_em(
 
     if eq_classes.is_empty() {
         log::warn!("No reads mapped well to ASVs. Keeping original depths.");
+        let zero_abundances = vec![0.0; consensuses.len()];
+        finalize_read_assignments(
+            twin_reads,
+            consensuses,
+            read_assignments,
+            &zero_abundances,
+            total_assigned,
+            temp_dir,
+        );
         return;
     }
 
@@ -2202,6 +2374,15 @@ pub fn refine_asv_depths_with_em(
             consensus.depth = new_depth;
         }
     }
+
+    finalize_read_assignments(
+        twin_reads,
+        consensuses,
+        read_assignments,
+        &asv_abundances,
+        total_assigned,
+        temp_dir,
+    );
 
     // Filter out ASVs with zero depth after EM
     let original_count = consensuses.len();

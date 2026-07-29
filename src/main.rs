@@ -210,9 +210,8 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
     // Write final cluster information
     let final_clusters = output_dir.join("final_clusters.tsv");
 
-    // Change ids to the order to match up with the final asvs
-    consensuses.iter_mut().enumerate().for_each(|(i, c)| c.id = i);
-
+    // Preserve stable consensus IDs so read_to_asv_assignments.tsv and
+    // final_clusters.tsv refer to the same ASV identifiers.
     alignment::write_clusters_tsv(&consensuses, &twin_reads, &final_clusters, "final")
         .expect("Failed to write final_clusters.tsv");
     log::info!("=== SAVONT COMPLETED SUCCESSFULLY in {:?} SECONDS ===", time_start.elapsed().as_secs());
