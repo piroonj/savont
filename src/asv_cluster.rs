@@ -1112,6 +1112,14 @@ fn are_consensus_concordant(
     mismatches == 0 && matches >= consensus1.len().min(consensus2.len().max(2))
 }
 
+fn candidate_cluster_order(
+    current_cluster: usize,
+    cluster_count: usize,
+) -> impl Iterator<Item = usize> {
+    std::iter::once(current_cluster)
+        .chain((0..cluster_count).filter(move |&candidate| candidate != current_cluster))
+}
+
 /// Reassign reads to their best matching cluster based on SNPmer comparison
 /// Returns (reassigned_clusters, num_reassignments)
 fn reassign_reads_to_best_cluster(
@@ -1166,7 +1174,9 @@ fn reassign_reads_to_best_cluster(
             let mut best_cluster = cluster_idx;
             let mut best_score = (usize::MAX, 0); // (mismatches, matches) - lower mismatches and higher matches is better
 
-            for (candidate_idx, _) in cluster_consensus.iter().enumerate() {
+            // Score the current cluster first so exact ties keep the read in
+            // its existing cluster instead of favoring a lower candidate index.
+            for candidate_idx in candidate_cluster_order(cluster_idx, cluster_consensus.len()) {
                 // Build index of consensus splitmer -> kmer
                 let splitmer_to_kmer = &splitmer_to_consensus_kmers[candidate_idx];
 
@@ -1609,4 +1619,15 @@ pub fn recluster_using_consensus_reps(
 
     // Step 5: Return flattened clusters
     final_clusters
+}
+
+#[cfg(test)]
+mod reassignment_tests {
+    use super::candidate_cluster_order;
+
+    #[test]
+    fn current_cluster_is_scored_first_to_preserve_ties() {
+        let order: Vec<usize> = candidate_cluster_order(2, 4).collect();
+        assert_eq!(order, vec![2, 0, 1, 3]);
+    }
 }
