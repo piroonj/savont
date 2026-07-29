@@ -1,28 +1,49 @@
-use flexi_logger::style;
 use clap::Parser;
+use flexi_logger::style;
 use flexi_logger::{DeferredNow, Duplicate, FileSpec, Record};
+use fxhash::FxHashSet;
+use savont::alignment;
 use savont::asv_cluster;
+use savont::chimera;
+use savont::classify;
 use savont::cli;
 use savont::constants::*;
+use savont::databases;
+use savont::download;
 use savont::kmer_comp;
-use savont::classify;
-use savont::sintax;
 use savont::merge;
 use savont::seeding;
 use savont::seq_parse;
+use savont::sintax;
 use savont::types;
-use savont::alignment;
-use savont::types::ConsensusSequence;
 use savont::types::decode_kmer48;
+use savont::types::ConsensusSequence;
 use savont::utils::*;
-use savont::chimera;
-use savont::databases;
-use savont::download;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 use sysinfo::System;
-use fxhash::FxHashSet;
+
+fn cluster_read_count(clusters: &[Vec<usize>]) -> usize {
+    clusters.iter().map(Vec::len).sum()
+}
+
+fn consensus_read_count(consensuses: &[ConsensusSequence]) -> usize {
+    consensuses
+        .iter()
+        .map(|consensus| consensus.cluster.len())
+        .sum()
+}
+
+fn stderr_duplicate(log_level: cli::LogLevel) -> Duplicate {
+    match log_level {
+        cli::LogLevel::Error => Duplicate::Error,
+        cli::LogLevel::Warn => Duplicate::Warn,
+        cli::LogLevel::Info => Duplicate::Info,
+        cli::LogLevel::Debug => Duplicate::Debug,
+        cli::LogLevel::Trace => Duplicate::Trace,
+    }
+}
 
 fn main() {
     let args = cli::Cli::parse();
@@ -55,7 +76,10 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
     // Create temp directory for intermediate files
     let temp_dir = output_dir.join("temp");
     std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
-    log::info!("Created temp directory for intermediate files: {}", temp_dir.display());
+    log::info!(
+        "Created temp directory for intermediate files: {}",
+        temp_dir.display()
+    );
 
     log::info!("=== SAVONT STARTED: Generating ASVs ===");
     if !args.consensus_length_tolerance.is_finite() || args.consensus_length_tolerance < 0.0 {
@@ -76,6 +100,15 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
         &args,
         &temp_dir,
         &temp_dir.join("binary_temp"),
+    );
+    log::trace!(
+        "READ TRACE | stage=1 | step=marker_processing_complete | input_reads={} | retained_reads={} | removed_reads=0",
+        twin_reads.len(),
+        twin_reads.len(),
+    );
+    log::debug!(
+        "Stage 1 marker processing completed with {} retained reads",
+        twin_reads.len(),
     );
     if detected_low_poly && !args.low_polymorphism {
         log::warn!("Auto-enabling --low-polymorphism: >75% of reads have no SNPmers. SNPmer clustering and index will be skipped.");
@@ -98,19 +131,42 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
 
     log::info!("=== STAGE 2: Clustering reads by k-mers ===");
     let clusters = asv_cluster::cluster_reads_by_kmers(&twin_reads, &args, &temp_dir);
+    let stage2_reads = cluster_read_count(&clusters);
+    log::trace!(
+        "READ TRACE | stage=2 | step=stage_complete | input_reads={} | retained_reads={} | removed_reads={} | clusters={}",
+        twin_reads.len(),
+        stage2_reads,
+        twin_reads.len().saturating_sub(stage2_reads),
+        clusters.len(),
+    );
     log_memory_usage(true, "STAGE 2 DONE: Clustered reads by k-mers");
 
     log::info!("=== STAGE 3: Secondary clustering of reads by polymorphic markers ===");
+    let stage3_input_reads = cluster_read_count(&clusters);
     let clusters = asv_cluster::cluster_reads_by_snpmers(&twin_reads, &clusters, &args, &temp_dir);
+    let stage3_reads = cluster_read_count(&clusters);
+    log::trace!(
+        "READ TRACE | stage=3 | step=stage_complete | input_reads={} | retained_reads={} | removed_reads={} | clusters={}",
+        stage3_input_reads,
+        stage3_reads,
+        stage3_input_reads.saturating_sub(stage3_reads),
+        clusters.len(),
+    );
     log_memory_usage(true, "STAGE 3 DONE: Clustered reads by polymorphic markers");
 
     log::info!("=== STAGE 4: Generating consensus sequences and analyzing pileupes ===");
-    let mut consensuses = alignment::align_and_consensus(
-        &twin_reads,
-        clusters,
-        &args,
-        &temp_dir,
-        length_profile,
+    let stage4_input_reads = cluster_read_count(&clusters);
+    let stage4_input_clusters = clusters.len();
+    let mut consensuses =
+        alignment::align_and_consensus(&twin_reads, clusters, &args, &temp_dir, length_profile);
+    let consensus_built_reads = consensus_read_count(&consensuses);
+    log::trace!(
+        "READ TRACE | stage=4 | step=consensus_construction | input_reads={} | retained_reads={} | removed_reads={} | clusters_before={} | consensuses_built={}",
+        stage4_input_reads,
+        consensus_built_reads,
+        stage4_input_reads.saturating_sub(consensus_built_reads),
+        stage4_input_clusters,
+        consensuses.len(),
     );
     // Generate pileups for quality estimation
     let pileups = alignment::generate_consensus_pileups(&twin_reads, &mut consensuses, &args);
@@ -118,9 +174,38 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
     // Estimate quality error rates from top 10% of clusters
     let quality_error_map = alignment::estimate_quality_error_rates(&pileups, &consensuses, 0.1);
 
-    // Analyze pileup consensuses 
-    let mut low_qual_consensus = alignment::analyze_pileup_consensuses(pileups, &mut consensuses, &quality_error_map, &twin_reads, &args, &temp_dir);
-    log_memory_usage(true, "STAGE 4 DONE: Analyzed pileups and estimated consensus qualities");
+    // Analyze pileup consensuses
+    let mut low_qual_consensus = alignment::analyze_pileup_consensuses(
+        pileups,
+        &mut consensuses,
+        &quality_error_map,
+        &twin_reads,
+        &args,
+        &temp_dir,
+    );
+    let high_quality_reads = consensus_read_count(&consensuses);
+    let low_quality_reads = consensus_read_count(&low_qual_consensus);
+    log::trace!(
+        "READ TRACE | stage=4 | step=quality_filter | input_reads={} | retained_reads={} | removed_reads={} | diverted_reads={} | destination=low_quality_pool | high_quality_consensuses={} | low_quality_consensuses={}",
+        consensus_built_reads,
+        high_quality_reads,
+        consensus_built_reads.saturating_sub(high_quality_reads + low_quality_reads),
+        low_quality_reads,
+        consensuses.len(),
+        low_qual_consensus.len(),
+    );
+    log::debug!(
+        "STAGE 4 SUMMARY | input_reads={} | high_quality_reads={} | low_quality_pool_reads={} | high_quality_consensuses={} | low_quality_consensuses={}",
+        consensus_built_reads,
+        high_quality_reads,
+        low_quality_reads,
+        consensuses.len(),
+        low_qual_consensus.len(),
+    );
+    log_memory_usage(
+        true,
+        "STAGE 4 DONE: Analyzed pileups and estimated consensus qualities",
+    );
 
     // Decompress HPC sequences before merging and chimera detection
     for consensus in &mut consensuses {
@@ -132,13 +217,47 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
         consensus.decompress();
     }
 
-    alignment::write_consensus_fasta(&low_qual_consensus, &temp_dir.join("low_quality_consensus_sequences.fasta"), "lowqual")
-        .expect("Failed to write low_quality_consensus_sequences.fasta");
+    alignment::write_consensus_fasta(
+        &low_qual_consensus,
+        &temp_dir.join("low_quality_consensus_sequences.fasta"),
+        "lowqual",
+    )
+    .expect("Failed to write low_quality_consensus_sequences.fasta");
 
     // Merge similar consensus sequences based on alignment and depth (using decompressed sequences)
     // This also merges low quality consensuses into high quality ones
     log::info!("=== STAGE 5: Merging similar consensus sequences ===");
-    let mut consensuses = alignment::merge_similar_consensuses(&twin_reads, consensuses, low_qual_consensus, &args, &temp_dir);
+    let stage5_input_reads =
+        consensus_read_count(&consensuses) + consensus_read_count(&low_qual_consensus);
+    let stage5_input_consensuses = consensuses.len() + low_qual_consensus.len();
+    let mut consensuses = alignment::merge_similar_consensuses(
+        &twin_reads,
+        consensuses,
+        low_qual_consensus,
+        &args,
+        &temp_dir,
+    );
+    let stage5_cluster_reads = consensus_read_count(&consensuses);
+    let stage5_appended_reads: usize = consensuses
+        .iter()
+        .map(|consensus| consensus.appended_depth)
+        .sum();
+    log::trace!(
+        "READ TRACE | stage=5 | step=consensus_merge | input_reads={} | retained_reads={} | removed_reads={} | cluster_membership_reads={} | appended_depth_reads={} | consensuses_before={} | consensuses_after={}",
+        stage5_input_reads,
+        stage5_cluster_reads + stage5_appended_reads,
+        stage5_input_reads.saturating_sub(stage5_cluster_reads + stage5_appended_reads),
+        stage5_cluster_reads,
+        stage5_appended_reads,
+        stage5_input_consensuses,
+        consensuses.len(),
+    );
+    log::debug!(
+        "STAGE 5 SUMMARY | input_consensuses={} | output_consensuses={} | retained_reads={}",
+        stage5_input_consensuses,
+        consensuses.len(),
+        stage5_cluster_reads + stage5_appended_reads,
+    );
     log_memory_usage(true, "STAGE 5 DONE: Merged similar consensus sequences");
 
     // Detect and filter chimeric consensus sequences
@@ -148,11 +267,31 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
     }
 
     log::info!("=== STAGE 6: Detecting and filtering chimeric consensus sequences ===");
+    let stage6_input_reads = consensus_read_count(&consensuses);
+    let stage6_input_consensuses = consensuses.len();
     let chimeras = chimera::detect_chimeras(&mut consensuses, &args);
     let mut consensuses = chimera::filter_chimeras(consensuses, &chimeras);
+    let stage6_retained_reads = consensus_read_count(&consensuses);
+    log::trace!(
+        "READ TRACE | stage=6 | step=chimera_filter | input_reads={} | retained_reads={} | removed_reads={} | consensuses_before={} | consensuses_after={}",
+        stage6_input_reads,
+        stage6_retained_reads,
+        stage6_input_reads.saturating_sub(stage6_retained_reads),
+        stage6_input_consensuses,
+        consensuses.len(),
+    );
+    log::debug!(
+        "STAGE 6 SUMMARY | detected_chimeras={} | retained_consensuses={} | retained_reads={}",
+        chimeras.len(),
+        consensuses.len(),
+        stage6_retained_reads,
+    );
     log_memory_usage(true, "STAGE 6 DONE: Filtered chimeric consensus sequences");
 
-    log::info!("=== Final consensus count after chimera filtering: {} ===", consensuses.len());
+    log::info!(
+        "=== Final consensus count after chimera filtering: {} ===",
+        consensuses.len()
+    );
 
     // Check for within-ASV heterogeneity
     // if args.phase_heterogeneous {
@@ -162,26 +301,69 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
 
     // Refine ASV depths using EM algorithm on read-level mappings
     log::info!("=== STAGE 7: Refining ASV depths with alignments and EM algorithm ===");
-    alignment::refine_asv_depths_with_em(&twin_reads, &mut consensuses, &kmer_info, &args, &temp_dir);
+    let stage7_input_reads = twin_reads.len();
+    let stage7_input_consensuses = consensuses.len();
+    alignment::refine_asv_depths_with_em(
+        &twin_reads,
+        &mut consensuses,
+        &kmer_info,
+        &args,
+        &temp_dir,
+    );
     consensuses.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap());
+    let stage7_retained_reads = consensus_read_count(&consensuses);
+    log::trace!(
+        "READ TRACE | stage=7 | step=em_hard_assignment | input_reads={} | retained_reads={} | removed_reads={} | consensuses_before={} | consensuses_after={}",
+        stage7_input_reads,
+        stage7_retained_reads,
+        stage7_input_reads.saturating_sub(stage7_retained_reads),
+        stage7_input_consensuses,
+        consensuses.len(),
+    );
+    log::debug!(
+        "STAGE 7 SUMMARY | input_reads={} | assigned_reads={} | filtered_reads={} | retained_consensuses={}",
+        stage7_input_reads,
+        stage7_retained_reads,
+        stage7_input_reads.saturating_sub(stage7_retained_reads),
+        consensuses.len(),
+    );
     log_memory_usage(true, "STAGE 7 DONE: Refined ASV depths with EM algorithm");
 
-    log::info!("Final consensus count after EM refinement: {}", consensuses.len());
+    log::info!(
+        "Final consensus count after EM refinement: {}",
+        consensuses.len()
+    );
 
     // Write final consensus sequences after EM refinement
     let output_dir = std::path::PathBuf::from(&args.output_dir);
     let final_fasta = output_dir.join(ASV_FILE);
 
     // Per-sample quantification (--pooled-samples)
-    let sample_names_owned: Vec<String> = args.input_files.iter()
-        .map(|f| Path::new(f).file_stem().and_then(|s| s.to_str()).unwrap_or("sample").to_string())
+    let sample_names_owned: Vec<String> = args
+        .input_files
+        .iter()
+        .map(|f| {
+            Path::new(f)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("sample")
+                .to_string()
+        })
         .collect();
     if args.pooled_samples && args.input_files.len() > 1 {
-        log::info!("=== STAGE 7b: Per-sample quantification for {} samples ===", args.input_files.len());
+        log::info!(
+            "=== STAGE 7b: Per-sample quantification for {} samples ===",
+            args.input_files.len()
+        );
         let n_samples = args.input_files.len();
         let asv_fasta_for_per_sample = temp_dir.join("final_asvs_for_em.fasta");
         let per_sample = alignment::compute_per_sample_depths(
-            &twin_reads, n_samples, &consensuses, &kmer_info, &args, &asv_fasta_for_per_sample,
+            &twin_reads,
+            n_samples,
+            &consensuses,
+            &kmer_info,
+            &args,
+            &asv_fasta_for_per_sample,
         );
         for (i, c) in consensuses.iter_mut().enumerate() {
             c.per_sample_depths = per_sample[i].clone();
@@ -191,7 +373,11 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
 
     alignment::write_consensus_fasta(&consensuses, &final_fasta, "final")
         .expect(format!("Failed to write {}", ASV_FILE).as_str());
-    log::info!("Wrote {} final consensus sequences to {}", consensuses.len(), ASV_FILE);
+    log::info!(
+        "Wrote {} final consensus sequences to {}",
+        consensuses.len(),
+        ASV_FILE
+    );
 
     // Write QIIME2-compatible feature table
     let sample_name_refs: Vec<&str> = sample_names_owned.iter().map(|s| s.as_str()).collect();
@@ -219,7 +405,10 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
     let consensus_id_map = output_dir.join("final_consensus_id_map.tsv");
     alignment::write_consensus_id_map(&consensuses, &consensus_id_map, "final")
         .expect("Failed to write final_consensus_id_map.tsv");
-    log::info!("=== SAVONT COMPLETED SUCCESSFULLY in {:?} SECONDS ===", time_start.elapsed().as_secs());
+    log::info!(
+        "=== SAVONT COMPLETED SUCCESSFULLY in {:?} SECONDS ===",
+        time_start.elapsed().as_secs()
+    );
 }
 
 fn run_classify(args: &cli::ClassifyArgs, cli_args: &cli::Cli) {
@@ -227,11 +416,10 @@ fn run_classify(args: &cli::ClassifyArgs, cli_args: &cli::Cli) {
 
     log::info!("Starting classification...");
     let db_path = Path::new(&args.db);
-    let db = databases::load_database(db_path)
-        .unwrap_or_else(|e| {
-            log::error!("{}", e);
-            std::process::exit(1);
-        });
+    let db = databases::load_database(db_path).unwrap_or_else(|e| {
+        log::error!("{}", e);
+        std::process::exit(1);
+    });
 
     classify::classify(args, &db);
 }
@@ -248,7 +436,9 @@ fn run_sintax(args: &cli::SintaxArgs, cli_args: &cli::Cli) {
     }
 
     let log_spec = format!("{},skani=info", cli_args.log_level_filter().to_string());
-    let filespec = FileSpec::default().directory(&output_dir).basename("savont_sintax");
+    let filespec = FileSpec::default()
+        .directory(&output_dir)
+        .basename("savont_sintax");
     let _logger_handle = flexi_logger::Logger::try_with_str(log_spec)
         .expect("Something went wrong with logging")
         .log_to_file(filespec)
@@ -284,7 +474,9 @@ fn run_export(args: &cli::ExportArgs, cli_args: &cli::Cli) {
     }
 
     let log_spec = format!("{}", cli_args.log_level_filter().to_string());
-    let filespec = FileSpec::default().directory(output_dir).basename("savont_export");
+    let filespec = FileSpec::default()
+        .directory(output_dir)
+        .basename("savont_export");
     let _logger_handle = flexi_logger::Logger::try_with_str(log_spec)
         .expect("Something went wrong with logging")
         .log_to_file(filespec)
@@ -364,8 +556,6 @@ fn initialize_setup_classify(args: &cli::ClassifyArgs, cli_args: &cli::Cli) -> P
     output_dir.to_path_buf()
 }
 
-
-
 fn my_own_format_colored(
     w: &mut dyn std::io::Write,
     now: &mut DeferredNow,
@@ -414,7 +604,8 @@ fn write_feature_table(
             let depth = c.depth + c.appended_depth;
             writeln!(f, "{}\t{}", otu_id, depth)?;
         } else {
-            let depth_str: Vec<String> = c.per_sample_depths.iter().map(|d| d.to_string()).collect();
+            let depth_str: Vec<String> =
+                c.per_sample_depths.iter().map(|d| d.to_string()).collect();
             writeln!(f, "{}\t{}", otu_id, depth_str.join("\t"))?;
         }
     }
@@ -422,7 +613,6 @@ fn write_feature_table(
 }
 
 fn initialize_setup_cluster(args: &mut cli::ClusterArgs, cli_args: &cli::Cli) -> PathBuf {
-
     if args.markdown_help {
         let markdown_options = clap_markdown::MarkdownOptions::default();
         markdown_options.show_table_of_contents(true);
@@ -430,9 +620,8 @@ fn initialize_setup_cluster(args: &mut cli::ClusterArgs, cli_args: &cli::Cli) ->
         std::process::exit(0);
     }
 
-
     for file in &args.input_files {
-        if !Path::new(file).exists() && file != MAGIC_EXIST_STRING{
+        if !Path::new(file).exists() && file != MAGIC_EXIST_STRING {
             eprintln!(
                 "ERROR [savont] Input file {} does not exist. Exiting.",
                 file
@@ -456,13 +645,11 @@ fn initialize_setup_cluster(args: &mut cli::ClusterArgs, cli_args: &cli::Cli) ->
 
     // Initialize logger with CLI-specified level
     let log_spec = format!("{},skani=info", cli_args.log_level_filter().to_string());
-    let filespec = FileSpec::default()
-        .directory(output_dir)
-        .basename("savont");
+    let filespec = FileSpec::default().directory(output_dir).basename("savont");
     let _logger_handle = flexi_logger::Logger::try_with_str(log_spec)
         .expect("Something went wrong with logging")
         .log_to_file(filespec) // write logs to file
-        .duplicate_to_stderr(Duplicate::Info) // print warnings and errors also to the console
+        .duplicate_to_stderr(stderr_duplicate(cli_args.log_level))
         .format(my_own_format_colored) // use a simple colored format
         .format_for_files(my_own_format)
         .start()
@@ -471,10 +658,16 @@ fn initialize_setup_cluster(args: &mut cli::ClusterArgs, cli_args: &cli::Cli) ->
     let command_args: Vec<String> = std::env::args().collect();
     log::info!("COMMAND: {}", command_args.join(" "));
     log::info!("VERSION: {}", env!("CARGO_PKG_VERSION"));
-    log::info!("SYSTEM NAME: {}", System::name().unwrap_or(format!("Unknown")));
-    log::info!("SYSTEM HOST NAME: {}", System::host_name().unwrap_or(format!("Unknown")));
+    log::info!(
+        "SYSTEM NAME: {}",
+        System::name().unwrap_or(format!("Unknown"))
+    );
+    log::info!(
+        "SYSTEM HOST NAME: {}",
+        System::host_name().unwrap_or(format!("Unknown"))
+    );
     //log::debug!("BINARY BUILD DATE: {}",  built_info::BUILT_TIME_UTC);
-        // The built info is available in the `built` module
+    // The built info is available in the `built` module
 
     // Validate k-mer size
     if args.kmer_size % 2 == 0 {
@@ -489,7 +682,7 @@ fn initialize_setup_cluster(args: &mut cli::ClusterArgs, cli_args: &cli::Cli) ->
         args.max_read_length = 5000;
     }
 
-    if args.hifi{
+    if args.hifi {
         log::info!("=== PRESET: Using PacBio HiFi preset. Adjusting parameters... ===");
         args.min_cluster_size = 4;
     }
@@ -504,7 +697,10 @@ fn initialize_setup_cluster(args: &mut cli::ClusterArgs, cli_args: &cli::Cli) ->
     return output_dir.to_path_buf();
 }
 
-fn get_kmers_and_snpmers(args: &cli::ClusterArgs, output_dir: &PathBuf) -> (types::KmerGlobalInfo, types::BlockmerGlobalInfo) {
+fn get_kmers_and_snpmers(
+    args: &cli::ClusterArgs,
+    output_dir: &PathBuf,
+) -> (types::KmerGlobalInfo, types::BlockmerGlobalInfo) {
     let saved_input = args.input_files == [MAGIC_EXIST_STRING];
 
     let binary_temp_dir = output_dir.join("binary_temp");
@@ -520,7 +716,8 @@ fn get_kmers_and_snpmers(args: &cli::ClusterArgs, output_dir: &PathBuf) -> (type
     }
 
     let start = Instant::now();
-    let (big_snpmer_map, big_blockmer_map) = seq_parse::read_to_split_kmers(args.kmer_size, args.blockmer_length, args.threads, &args);
+    let (big_snpmer_map, big_blockmer_map) =
+        seq_parse::read_to_split_kmers(args.kmer_size, args.blockmer_length, args.threads, &args);
     log::info!(
         "Time elapsed in for counting k-mers is: {:?}",
         start.elapsed()
@@ -528,13 +725,18 @@ fn get_kmers_and_snpmers(args: &cli::ClusterArgs, output_dir: &PathBuf) -> (type
 
     let start = Instant::now();
     if args.use_blockmers {
-        blockmer_info = kmer_comp::get_blockmers_inplace_sort(big_blockmer_map, &big_snpmer_map, args.kmer_size, args.blockmer_length, &args);
+        blockmer_info = kmer_comp::get_blockmers_inplace_sort(
+            big_blockmer_map,
+            &big_snpmer_map,
+            args.kmer_size,
+            args.blockmer_length,
+            &args,
+        );
         log::info!(
             "Time elapsed in for parsing blockmers is: {:?}",
             start.elapsed()
         );
-    }
-    else{
+    } else {
         blockmer_info = types::BlockmerGlobalInfo::default();
     }
 
@@ -557,34 +759,70 @@ fn get_twin_reads_from_kmer_info(
 ) -> (Vec<types::TwinRead>, bool) {
     log::info!("Getting reads...");
     let mut twin_reads_raw = kmer_comp::twin_reads_from_snpmers(kmer_info, blockmer_info, &args);
-    twin_reads_raw.sort_by(|a,b| b.est_id.unwrap_or(100.0).partial_cmp(&a.est_id.unwrap_or(100.0)).unwrap());
-    let num_reads_without_snpmers = twin_reads_raw.iter().filter(|tr| tr.snpmers_vec().is_empty()).count();
+    twin_reads_raw.sort_by(|a, b| {
+        b.est_id
+            .unwrap_or(100.0)
+            .partial_cmp(&a.est_id.unwrap_or(100.0))
+            .unwrap()
+    });
+    let num_reads_without_snpmers = twin_reads_raw
+        .iter()
+        .filter(|tr| tr.snpmers_vec().is_empty())
+        .count();
     let fraction_without = num_reads_without_snpmers as f64 / twin_reads_raw.len() as f64;
-    log::info!("Total reads: {}, Reads without SNPmers: {} ({:.2}%)",
-        twin_reads_raw.len(), num_reads_without_snpmers, fraction_without * 100.0);
+    log::info!(
+        "Total reads: {}, Reads without SNPmers: {} ({:.2}%)",
+        twin_reads_raw.len(),
+        num_reads_without_snpmers,
+        fraction_without * 100.0
+    );
     let auto_low_poly = fraction_without > 0.75;
-    if fraction_without > 0.10{
+    if fraction_without > 0.10 {
         log::warn!("High fraction of reads without SNPmers: {:.2}%. This may indicate low polymorphism in the sample. SAVONT MAY FAIL!", fraction_without * 100.0);
     }
     (twin_reads_raw, auto_low_poly)
 }
 
-fn debug_consensus_twin_read(kmer_info: &types::KmerGlobalInfo, consensuses: &[ConsensusSequence], args: &cli::ClusterArgs) {
-
+fn debug_consensus_twin_read(
+    kmer_info: &types::KmerGlobalInfo,
+    consensuses: &[ConsensusSequence],
+    args: &cli::ClusterArgs,
+) {
     use std::collections::HashSet;
     let mut snpmer_set = HashSet::default();
-    for snpmer_i in kmer_info.snpmer_info.iter(){
+    for snpmer_i in kmer_info.snpmer_info.iter() {
         let k = snpmer_i.k as usize;
-        let snpmer1 = snpmer_i.split_kmer as u64 | ((snpmer_i.mid_bases[0] as u64) << (k-1) );
-        let snpmer2 = snpmer_i.split_kmer as u64 | ((snpmer_i.mid_bases[1] as u64) << (k-1) );
+        let snpmer1 = snpmer_i.split_kmer as u64 | ((snpmer_i.mid_bases[0] as u64) << (k - 1));
+        let snpmer2 = snpmer_i.split_kmer as u64 | ((snpmer_i.mid_bases[1] as u64) << (k - 1));
         snpmer_set.insert(snpmer1);
         snpmer_set.insert(snpmer2);
     }
 
-    for (i,consensus) in consensuses.iter().enumerate() {
-        log::trace!("Consensus ID: {}, Index {}, Depth: {}, Length: {}", consensus.id, i, consensus.depth, consensus.decompressed_sequence.as_ref().unwrap().len());
-        let tr_rep = seeding::get_twin_read_syncmer(consensus.decompressed_sequence.as_ref().unwrap().clone(), None, args.kmer_size, args.c, args.blockmer_length, &snpmer_set, &FxHashSet::default(), String::new(), args.minimum_base_quality).unwrap();
-        let snpmers = tr_rep.snpmers_vec().into_iter().map(|(pos, kmer48)| (pos, decode_kmer48(kmer48, args.kmer_size as u8))).collect::<Vec<_>>();
+    for (i, consensus) in consensuses.iter().enumerate() {
+        log::trace!(
+            "Consensus ID: {}, Index {}, Depth: {}, Length: {}",
+            consensus.id,
+            i,
+            consensus.depth,
+            consensus.decompressed_sequence.as_ref().unwrap().len()
+        );
+        let tr_rep = seeding::get_twin_read_syncmer(
+            consensus.decompressed_sequence.as_ref().unwrap().clone(),
+            None,
+            args.kmer_size,
+            args.c,
+            args.blockmer_length,
+            &snpmer_set,
+            &FxHashSet::default(),
+            String::new(),
+            args.minimum_base_quality,
+        )
+        .unwrap();
+        let snpmers = tr_rep
+            .snpmers_vec()
+            .into_iter()
+            .map(|(pos, kmer48)| (pos, decode_kmer48(kmer48, args.kmer_size as u8)))
+            .collect::<Vec<_>>();
         log::trace!("SNPmer bases are: {:?}", snpmers);
     }
 }
