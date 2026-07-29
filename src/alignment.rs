@@ -1069,20 +1069,57 @@ pub fn write_clusters_tsv(
     output_path: &std::path::Path,
     prefix: &str,
 ) -> std::io::Result<()> {
+    write_clusters_tsv_with_ids(
+        consensuses,
+        twin_reads,
+        output_path,
+        prefix,
+        false,
+    )
+}
+
+/// Write final clusters using the same public index as the consensus FASTA.
+pub fn write_output_clusters_tsv(
+    consensuses: &[ConsensusSequence],
+    twin_reads: &[TwinRead],
+    output_path: &std::path::Path,
+    prefix: &str,
+) -> std::io::Result<()> {
+    write_clusters_tsv_with_ids(
+        consensuses,
+        twin_reads,
+        output_path,
+        prefix,
+        true,
+    )
+}
+
+fn write_clusters_tsv_with_ids(
+    consensuses: &[ConsensusSequence],
+    twin_reads: &[TwinRead],
+    output_path: &std::path::Path,
+    prefix: &str,
+    use_output_index: bool,
+) -> std::io::Result<()> {
     let mut writer = std::io::BufWriter::new(std::fs::File::create(output_path)?);
 
-    for (_, consensus) in consensuses.iter().enumerate() {
+    for (output_index, consensus) in consensuses.iter().enumerate() {
         let cluster = &consensus.cluster;
         if cluster.is_empty() {
             continue;
         }
 
         let representative = cluster[0];
+        let cluster_id = if use_output_index {
+            output_index
+        } else {
+            consensus.id
+        };
         writeln!(
             writer,
             "{}_cluster_{}\tsize_{}\trepresentative_{}\tmembers\n{}",
             prefix,
-            consensus.id,
+            cluster_id,
             cluster.len(),
             representative,
             cluster.iter().map(|x| format!("{} {}", &twin_reads[*x].id, &twin_reads[*x].est_id.unwrap_or(100.))).collect::<Vec<_>>().join("\n")
@@ -1090,6 +1127,121 @@ pub fn write_clusters_tsv(
     }
 
     Ok(())
+}
+
+/// Return the public output identifier shared by FASTA and feature-table files.
+pub fn consensus_output_id(
+    prefix: &str,
+    output_index: usize,
+    consensus: &ConsensusSequence,
+) -> String {
+    let depth_field = if consensus.per_sample_depths.is_empty() {
+        (consensus.depth + consensus.appended_depth).to_string()
+    } else {
+        consensus
+            .per_sample_depths
+            .iter()
+            .map(|depth| depth.to_string())
+            .collect::<Vec<_>>()
+            .join("-")
+    };
+    format!("{}_consensus_{}_depth_{}", prefix, output_index, depth_field)
+}
+
+/// Write the relationship between public output IDs and internal ASV IDs.
+pub fn write_consensus_id_map(
+    consensuses: &[ConsensusSequence],
+    output_path: &std::path::Path,
+    prefix: &str,
+) -> std::io::Result<()> {
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(output_path)?);
+    writeln!(writer, "output_consensus_id\tinternal_asv_id")?;
+    for (output_index, consensus) in consensuses.iter().enumerate() {
+        writeln!(
+            writer,
+            "{}\t{}",
+            consensus_output_id(prefix, output_index, consensus),
+            consensus.id,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod output_identifier_tests {
+    use super::{
+        consensus_output_id,
+        write_clusters_tsv,
+        write_consensus_id_map,
+        write_output_clusters_tsv,
+    };
+    use crate::types::{ConsensusSequence, TwinRead};
+    use std::fs;
+    use tempfile::NamedTempFile;
+
+    fn consensus(internal_id: usize, depth: usize, read_index: usize) -> ConsensusSequence {
+        let mut consensus = ConsensusSequence::default();
+        consensus.id = internal_id;
+        consensus.depth = depth;
+        consensus.cluster = vec![read_index];
+        consensus
+    }
+
+    #[test]
+    fn final_cluster_ids_follow_consensus_output_order() {
+        let consensuses = vec![consensus(7, 20, 0), consensus(2, 10, 1)];
+        let mut reads = vec![TwinRead::default(), TwinRead::default()];
+        reads[0].id = "read-0".to_string();
+        reads[1].id = "read-1".to_string();
+        let output = NamedTempFile::new().unwrap();
+
+        write_output_clusters_tsv(
+            &consensuses,
+            &reads,
+            output.path(),
+            "final",
+        )
+        .unwrap();
+
+        let text = fs::read_to_string(output.path()).unwrap();
+        assert!(text.contains("final_cluster_0\tsize_1"));
+        assert!(text.contains("final_cluster_1\tsize_1"));
+        assert!(!text.contains("final_cluster_7"));
+    }
+
+    #[test]
+    fn intermediate_cluster_ids_remain_internal() {
+        let consensuses = vec![consensus(7, 20, 0)];
+        let mut reads = vec![TwinRead::default()];
+        reads[0].id = "read-0".to_string();
+        let output = NamedTempFile::new().unwrap();
+
+        write_clusters_tsv(&consensuses, &reads, output.path(), "prefilter").unwrap();
+
+        let text = fs::read_to_string(output.path()).unwrap();
+        assert!(text.contains("prefilter_cluster_7\tsize_1"));
+    }
+
+    #[test]
+    fn consensus_id_map_links_public_and_internal_ids() {
+        let mut pooled = consensus(2, 10, 0);
+        pooled.per_sample_depths = vec![6, 4];
+        let consensuses = vec![consensus(7, 20, 0), pooled];
+        let output = NamedTempFile::new().unwrap();
+
+        assert_eq!(
+            consensus_output_id("final", 0, &consensuses[0]),
+            "final_consensus_0_depth_20"
+        );
+        write_consensus_id_map(&consensuses, output.path(), "final").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(output.path()).unwrap(),
+            "output_consensus_id\tinternal_asv_id\n\
+             final_consensus_0_depth_20\t7\n\
+             final_consensus_1_depth_6-4\t2\n"
+        );
+    }
 }
 
 /// Write consensus sequences to a FASTA file
@@ -1107,13 +1259,9 @@ pub fn write_consensus_fasta(
         let consensus_seq = cons_clone.decompressed_sequence.clone().unwrap();
         let start_non = consensus_seq.iter().enumerate().find(|&(_i, &b)| b != b'N').map(|(i, _)| i).unwrap_or(0);
         let end_non = consensus_seq.iter().enumerate().rfind(|&(_i, &b)| b != b'N').map(|(i, _)| i + 1).unwrap_or(consensus_seq.len());
-        let depth_field = if consensus.per_sample_depths.is_empty() {
-            (consensus.depth + consensus.appended_depth).to_string()
-        } else {
-            consensus.per_sample_depths.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("-")
-        };
-        let header = format!(">{}_consensus_{}_depth_{} debug_id:{} chimera_score:{} unambiguous_read_assignments:{} ambig_read_assignments:{} num_align_leq_10_mismatches:{}",
-            prefix, i, depth_field, consensus.id, consensus.chimera_score.unwrap_or(0), consensus.unambig_best_read_map_count.unwrap_or(0),
+        let output_id = consensus_output_id(prefix, i, consensus);
+        let header = format!(">{} debug_id:{} chimera_score:{} unambiguous_read_assignments:{} ambig_read_assignments:{} num_align_leq_10_mismatches:{}",
+            output_id, consensus.id, consensus.chimera_score.unwrap_or(0), consensus.unambig_best_read_map_count.unwrap_or(0),
             consensus.ambig_read_map_count.unwrap_or(0), consensus.num_map_leq_10nm.unwrap_or(0));
         writeln!(writer, "{}", header)?;
 

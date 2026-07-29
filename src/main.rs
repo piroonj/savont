@@ -210,10 +210,15 @@ fn run_cluster(args: &cli::ClusterArgs, cli_args: &cli::Cli) {
     // Write final cluster information
     let final_clusters = output_dir.join("final_clusters.tsv");
 
-    // Preserve stable consensus IDs so read_to_asv_assignments.tsv and
-    // final_clusters.tsv refer to the same ASV identifiers.
-    alignment::write_clusters_tsv(&consensuses, &twin_reads, &final_clusters, "final")
+    // Use the same public output index as final_asvs.fasta and feature-table.tsv.
+    alignment::write_output_clusters_tsv(&consensuses, &twin_reads, &final_clusters, "final")
         .expect("Failed to write final_clusters.tsv");
+
+    // Preserve the relationship to the internal IDs used by the EM assignment
+    // audit without exposing those IDs as public cluster numbering.
+    let consensus_id_map = output_dir.join("final_consensus_id_map.tsv");
+    alignment::write_consensus_id_map(&consensuses, &consensus_id_map, "final")
+        .expect("Failed to write final_consensus_id_map.tsv");
     log::info!("=== SAVONT COMPLETED SUCCESSFULLY in {:?} SECONDS ===", time_start.elapsed().as_secs());
 }
 
@@ -404,12 +409,12 @@ fn write_feature_table(
     let mut f = std::fs::File::create(path)?;
     writeln!(f, "#OTU ID\t{}", sample_names.join("\t"))?;
     for (i, c) in consensuses.iter().enumerate() {
+        let otu_id = alignment::consensus_output_id("final", i, c);
         if c.per_sample_depths.is_empty() {
             let depth = c.depth + c.appended_depth;
-            writeln!(f, "final_consensus_{}_depth_{}\t{}", i, depth, depth)?;
+            writeln!(f, "{}\t{}", otu_id, depth)?;
         } else {
             let depth_str: Vec<String> = c.per_sample_depths.iter().map(|d| d.to_string()).collect();
-            let otu_id = format!("final_consensus_{}_depth_{}", i, depth_str.join("-"));
             writeln!(f, "{}\t{}", otu_id, depth_str.join("\t"))?;
         }
     }
