@@ -1720,13 +1720,131 @@ fn lq_criteria(consensus: &ConsensusSequence, args: &Cli) -> bool {
             < args.n_depth_cutoff)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KmerDedupAuditRow {
+    query_id: usize,
+    query_depth: usize,
+    candidate_targets: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Stage5MergeAuditRow {
+    query_id: usize,
+    target_id: usize,
+    final_target_id: Option<usize>,
+    query_depth: usize,
+    target_depth: usize,
+    adjusted_errors: Option<usize>,
+    relative_depth: Option<f64>,
+    threshold: Option<f64>,
+    snpmer_conflicts: usize,
+    decision: &'static str,
+    reason: &'static str,
+}
+
+fn write_kmer_dedup_audit(rows: &[KmerDedupAuditRow], output_path: &Path) -> std::io::Result<()> {
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(output_path)?);
+    writeln!(
+        writer,
+        "query_consensus\tquery_depth\tcandidate_consensuses\tcandidate_depths\tdecision\treason"
+    )?;
+    for row in rows {
+        let targets = row
+            .candidate_targets
+            .iter()
+            .map(|(target_id, _)| target_id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let depths = row
+            .candidate_targets
+            .iter()
+            .map(|(_, target_depth)| target_depth.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\tdropped\tminimizer_subset_of_deeper_snpmer_compatible_consensus",
+            row.query_id, row.query_depth, targets, depths,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_stage5_merge_audit(
+    rows: &[Stage5MergeAuditRow],
+    output_path: &Path,
+) -> std::io::Result<()> {
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(output_path)?);
+    writeln!(
+        writer,
+        "query_consensus\ttarget_consensus\tfinal_target_consensus\tquery_depth\ttarget_depth\tadjusted_errors\trelative_depth\tthreshold\tsnpmer_conflicts\tdecision\treason"
+    )?;
+    for row in rows {
+        let final_target = row
+            .final_target_id
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let adjusted_errors = row
+            .adjusted_errors
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let relative_depth = row
+            .relative_depth
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default();
+        let threshold = row
+            .threshold
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default();
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.query_id,
+            row.target_id,
+            final_target,
+            row.query_depth,
+            row.target_depth,
+            adjusted_errors,
+            relative_depth,
+            threshold,
+            row.snpmer_conflicts,
+            row.decision,
+            row.reason,
+        )?;
+    }
+    Ok(())
+}
+
+fn merge_depth_decision(
+    query_idx: usize,
+    target_idx: usize,
+    query_depth: usize,
+    target_depth: usize,
+    adjusted_errors: usize,
+) -> (f64, f64, bool) {
+    let relative_depth = query_depth as f64 / target_depth as f64;
+    let mut threshold = 0.5_f64.powf((adjusted_errors as f64) * 0.75 + 1.25);
+    if adjusted_errors == 0 {
+        threshold = 0.999999;
+        if query_depth == target_depth {
+            return (relative_depth, threshold, query_idx > target_idx);
+        }
+    }
+    (
+        relative_depth,
+        threshold,
+        (relative_depth < threshold) || (1.0 / relative_depth < threshold),
+    )
+}
+
 fn remove_similar_seqs_kmers(
-    mut consensuses: Vec<ConsensusSequence>,
+    consensuses: Vec<ConsensusSequence>,
     twin_reads: &[TwinRead],
     k: usize,
-) -> Vec<ConsensusSequence> {
+) -> (Vec<ConsensusSequence>, Vec<KmerDedupAuditRow>) {
     let mut kmer_index = std::collections::HashMap::new();
-    let mut filtered_consensuses: Vec<ConsensusSequence> = Vec::new();
+    let mut retained_indices = FxHashSet::default();
+    let mut audit_rows = Vec::new();
     let mut consensus_id_to_minis = std::collections::HashMap::new();
     let adapter_buffer = 25;
     let snpmer_signatures: Vec<SnpmerSignature> = consensuses
@@ -1753,7 +1871,10 @@ fn remove_similar_seqs_kmers(
         consensus_id_to_minis.insert(i, minimizers);
     }
 
-    for (&enum_id, minimizers) in consensus_id_to_minis.iter() {
+    for enum_id in 0..consensuses.len() {
+        let Some(minimizers) = consensus_id_to_minis.get(&enum_id) else {
+            continue;
+        };
         let mut possible_greater_ids = std::collections::HashSet::new();
         let mut first = true;
         for mini in minimizers {
@@ -1785,11 +1906,118 @@ fn remove_similar_seqs_kmers(
             first = false;
         }
         if possible_greater_ids.is_empty() {
-            filtered_consensuses.push(std::mem::take(&mut consensuses[enum_id]));
+            retained_indices.insert(enum_id);
+        } else {
+            let mut candidate_targets = possible_greater_ids
+                .into_iter()
+                .map(|target_idx| (consensuses[target_idx].id, consensuses[target_idx].depth))
+                .collect::<Vec<_>>();
+            candidate_targets
+                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            audit_rows.push(KmerDedupAuditRow {
+                query_id: consensuses[enum_id].id,
+                query_depth: consensuses[enum_id].depth,
+                candidate_targets,
+            });
         }
     }
 
-    return filtered_consensuses;
+    let filtered_consensuses = consensuses
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, consensus)| retained_indices.contains(&index).then_some(consensus))
+        .collect();
+    audit_rows.sort_by_key(|row| row.query_id);
+    (filtered_consensuses, audit_rows)
+}
+
+#[cfg(test)]
+mod merge_audit_tests {
+    use super::{
+        merge_depth_decision, remove_similar_seqs_kmers, write_kmer_dedup_audit,
+        write_stage5_merge_audit, KmerDedupAuditRow, Stage5MergeAuditRow,
+    };
+    use crate::types::ConsensusSequence;
+    use std::fs;
+    use tempfile::NamedTempFile;
+
+    fn consensus(id: usize, depth: usize) -> ConsensusSequence {
+        let mut consensus = ConsensusSequence::default();
+        consensus.id = id;
+        consensus.depth = depth;
+        consensus.sequence = b"ACGTTGCAGATCCGATGCTA".repeat(10);
+        consensus
+    }
+
+    #[test]
+    fn depth_decision_preserves_direction_for_identical_equal_depths() {
+        assert!(!merge_depth_decision(0, 1, 20, 20, 0).2);
+        assert!(merge_depth_decision(1, 0, 20, 20, 0).2);
+    }
+
+    #[test]
+    fn depth_decision_accepts_only_sufficiently_imbalanced_clusters() {
+        assert!(merge_depth_decision(0, 1, 10, 100, 1).2);
+        assert!(!merge_depth_decision(0, 1, 60, 100, 1).2);
+    }
+
+    #[test]
+    fn kmer_dedup_records_the_deeper_compatible_candidate() {
+        let (retained, audit) =
+            remove_similar_seqs_kmers(vec![consensus(7, 100), consensus(2, 10)], &[], 21);
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, 7);
+        assert_eq!(
+            audit,
+            vec![KmerDedupAuditRow {
+                query_id: 2,
+                query_depth: 10,
+                candidate_targets: vec![(7, 100)],
+            }]
+        );
+    }
+
+    #[test]
+    fn audit_writers_emit_stable_headers_and_decisions() {
+        let kmer_output = NamedTempFile::new().unwrap();
+        write_kmer_dedup_audit(
+            &[KmerDedupAuditRow {
+                query_id: 2,
+                query_depth: 10,
+                candidate_targets: vec![(7, 100)],
+            }],
+            kmer_output.path(),
+        )
+        .unwrap();
+        let kmer_text = fs::read_to_string(kmer_output.path()).unwrap();
+        assert!(kmer_text.contains(
+            "2\t10\t7\t100\tdropped\tminimizer_subset_of_deeper_snpmer_compatible_consensus"
+        ));
+
+        let stage5_output = NamedTempFile::new().unwrap();
+        write_stage5_merge_audit(
+            &[Stage5MergeAuditRow {
+                query_id: 2,
+                target_id: 7,
+                final_target_id: Some(7),
+                query_depth: 10,
+                target_depth: 100,
+                adjusted_errors: Some(1),
+                relative_depth: Some(0.1),
+                threshold: Some(0.25),
+                snpmer_conflicts: 0,
+                decision: "accepted",
+                reason: "alignment_depth_criteria",
+            }],
+            stage5_output.path(),
+        )
+        .unwrap();
+        let stage5_text = fs::read_to_string(stage5_output.path()).unwrap();
+        assert!(stage5_text.contains(
+            "2\t7\t7\t10\t100\t1\t0.100000\t0.250000\t0\taccepted\talignment_depth_criteria"
+        ));
+    }
 }
 
 /// Merge similar consensus sequences based on alignment and depth criteria
@@ -1806,14 +2034,29 @@ pub fn merge_similar_consensuses(
         return consensuses;
     }
 
+    // Preserve the complete post-quality-filter Stage 4 consensus set before
+    // any Stage 5 deduplication or alignment-based merging.
+    let polished_fasta = temp_dir.join("polished_consensuses.fasta");
+    write_consensus_fasta(&consensuses, &polished_fasta, "polished")
+        .expect("Failed to write polished_consensuses.fasta");
+    log::info!(
+        "Wrote {} true Stage 4 polished consensus sequences to polished_consensuses.fasta",
+        consensuses.len()
+    );
+
     // Look at [35,length-35] bases to avoid adapters. Take all k-mers. Remove subsetted reads at lower depth.
     log::info!("Removing duplicate consensus sequences based on k-mer similarity");
     let prev_size = consensuses.len();
-    let consensuses = remove_similar_seqs_kmers(consensuses, twin_reads, args.kmer_size);
+    let (consensuses, kmer_dedup_audit) =
+        remove_similar_seqs_kmers(consensuses, twin_reads, args.kmer_size);
+    let kmer_audit_path = temp_dir.join("kmer_dedup_audit.tsv");
+    write_kmer_dedup_audit(&kmer_dedup_audit, &kmer_audit_path)
+        .expect("Failed to write kmer_dedup_audit.tsv");
     log::info!(
-        "Reduced consensus sequences from {} to {} after k-mer based deduplication",
+        "Reduced consensus sequences from {} to {} after k-mer based deduplication; wrote {}",
         prev_size,
-        consensuses.len()
+        consensuses.len(),
+        kmer_audit_path.display(),
     );
 
     let snpmer_signatures: Vec<SnpmerSignature> = consensuses
@@ -1825,14 +2068,17 @@ pub fn merge_similar_consensuses(
         .map(|consensus| build_snpmer_signature(&consensus.cluster, twin_reads, args.kmer_size))
         .collect();
     let snpmer_rejections: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+    let merge_audit_rows: Mutex<Vec<Stage5MergeAuditRow>> = Mutex::new(Vec::new());
 
-    // Write polished consensus sequences to FASTA for indexing
-    let output_fasta_path = temp_dir.join("polished_consensuses.fasta");
-    write_consensus_fasta(&consensuses, &output_fasta_path, "polished")
-        .expect("Failed to write polished_consensuses.fasta");
+    // Stage 5 aligns only the k-mer-deduplicated consensus set. Keep this
+    // separate from the true Stage 4 FASTA used by cypFAST.
+    let stage5_input_fasta = temp_dir.join("deduplicated_consensuses_stage5_input.fasta");
+    write_consensus_fasta(&consensuses, &stage5_input_fasta, "deduplicated")
+        .expect("Failed to write deduplicated_consensuses_stage5_input.fasta");
     log::info!(
-        "Wrote {} polished consensus sequences to polished_consensuses.fasta",
-        consensuses.len()
+        "Wrote {} k-mer-deduplicated consensuses to {}",
+        consensuses.len(),
+        stage5_input_fasta.display()
     );
 
     // Build aligner using the first consensus as reference
@@ -1840,7 +2086,7 @@ pub fn merge_similar_consensuses(
         .lrhq()
         .with_index_threads(args.threads)
         .with_cigar()
-        .with_index(output_fasta_path.to_str().unwrap(), None)
+        .with_index(stage5_input_fasta.to_str().unwrap(), None)
         .expect("Failed to create aligner");
 
     aligner.mapopt.set_no_diag();
@@ -1884,6 +2130,22 @@ pub fn merge_similar_consensuses(
                             .lock()
                             .unwrap()
                             .push((low_qual_consensus.id, consensuses[target_idx].id, conflicts));
+                        merge_audit_rows.lock().unwrap().push(Stage5MergeAuditRow {
+                            query_id: low_qual_consensus.id,
+                            target_id: consensuses[target_idx].id,
+                            final_target_id: None,
+                            query_depth: low_qual_consensus.depth,
+                            target_depth: consensuses[target_idx].depth,
+                            adjusted_errors: Some(alignment.nm as usize),
+                            relative_depth: Some(
+                                low_qual_consensus.depth as f64
+                                    / consensuses[target_idx].depth as f64,
+                            ),
+                            threshold: None,
+                            snpmer_conflicts: conflicts,
+                            decision: "rejected",
+                            reason: "snpmer_conflict_low_quality",
+                        });
                         return;
                     }
 
@@ -1891,7 +2153,11 @@ pub fn merge_similar_consensuses(
                         low_qual_idx, low_qual_consensus.id, low_qual_consensus.depth, target_idx, consensuses[target_idx].depth, alignment.nm);
 
                     // Store the mapping: (low_qual_consensus, target_idx)
-                    low_qual_mappings.lock().unwrap().push((low_qual_idx, target_idx));
+                    low_qual_mappings.lock().unwrap().push((
+                        low_qual_idx,
+                        target_idx,
+                        alignment.nm as usize,
+                    ));
                 }
             }
         }
@@ -1901,10 +2167,25 @@ pub fn merge_similar_consensuses(
     let low_qual_mappings = low_qual_mappings.into_inner().unwrap();
     let mut consensuses = consensuses;
 
-    for (query_idx, target_idx) in low_qual_mappings {
+    for (query_idx, target_idx, adjusted_errors) in low_qual_mappings {
         // Merge the clusters
         let low_qual_consensus = &low_qual_consensuses[query_idx];
         consensuses[target_idx].appended_depth += low_qual_consensus.depth;
+        merge_audit_rows.lock().unwrap().push(Stage5MergeAuditRow {
+            query_id: low_qual_consensus.id,
+            target_id: consensuses[target_idx].id,
+            final_target_id: Some(consensuses[target_idx].id),
+            query_depth: low_qual_consensus.depth,
+            target_depth: consensuses[target_idx].depth,
+            adjusted_errors: Some(adjusted_errors),
+            relative_depth: Some(
+                low_qual_consensus.depth as f64 / consensuses[target_idx].depth as f64,
+            ),
+            threshold: None,
+            snpmer_conflicts: 0,
+            decision: "accepted",
+            reason: "low_quality_consensus_append",
+        });
     }
 
     log::info!("Merging similar consensus sequences based on alignment and depth criteria");
@@ -1981,6 +2262,26 @@ pub fn merge_similar_consensuses(
                             .lock()
                             .unwrap()
                             .push((consensuses[query_idx].id, target_consensus.id, conflicts));
+                        let (relative_depth, threshold, _) = merge_depth_decision(
+                            query_idx,
+                            target_idx,
+                            consensuses[query_idx].depth,
+                            target_consensus.depth,
+                            adjusted_errors,
+                        );
+                        merge_audit_rows.lock().unwrap().push(Stage5MergeAuditRow {
+                            query_id: consensuses[query_idx].id,
+                            target_id: target_consensus.id,
+                            final_target_id: None,
+                            query_depth: consensuses[query_idx].depth,
+                            target_depth: target_consensus.depth,
+                            adjusted_errors: Some(adjusted_errors),
+                            relative_depth: Some(relative_depth),
+                            threshold: Some(threshold),
+                            snpmer_conflicts: conflicts,
+                            decision: "rejected",
+                            reason: "snpmer_conflict",
+                        });
                         continue;
                     }
 
@@ -2037,29 +2338,20 @@ pub fn merge_similar_consensuses(
                 let query_depth = consensuses[query_idx].depth;
                 let target_depth = *t_depth;
 
-                // Calculate relative depth and threshold
-                let relative_depth = query_depth as f64 / target_depth as f64;
-                let mut threshold = 0.5_f64.powf((*nm as f64) * 0.75 + 1.25);
-                if *nm == 0{
-                    threshold = 0.999999; // More lenient for perfect matches
-
-                    // Handle special case of identical consensuses
-                    if query_depth == target_depth{
-                        if query_idx > *t_idx{
-                            // To avoid circular merges, only allow one direction for identical consensuses
-                            return true;
-                        }
-                        else{
-                            return false;
-                        }
-                    }
-                }
+                let (relative_depth, threshold, should_merge) =
+                    merge_depth_decision(
+                        query_idx,
+                        *t_idx,
+                        query_depth,
+                        target_depth,
+                        *nm,
+                    );
 
                 log::trace!("Considering merge: Query {} (depth {}) -> Target {} (depth {}), Adjusted errors {}, Relative depth {:.4}, Threshold {:.4} => {}",
                     consensuses[query_idx].id, query_depth, consensuses[*t_idx].id, target_depth, nm, relative_depth, threshold,
-                    relative_depth < threshold);
+                    should_merge);
 
-                (relative_depth < threshold) || (1.0 / relative_depth < threshold)
+                should_merge
             })
             .map(|(_, t_idx, nm, t_depth)| (*t_idx, *nm, *t_depth))
             .collect();
@@ -2116,6 +2408,84 @@ pub fn merge_similar_consensuses(
             merged_into.insert(query_idx, final_target);
         }
     }
+
+    for (query_idx, target_idx, adjusted_errors, target_depth) in &mappings {
+        if query_idx == target_idx {
+            continue;
+        }
+        let query_depth = consensuses[*query_idx].depth;
+        let (relative_depth, threshold, depth_eligible) = merge_depth_decision(
+            *query_idx,
+            *target_idx,
+            query_depth,
+            *target_depth,
+            *adjusted_errors,
+        );
+        let accepted = merge_map.get(query_idx) == Some(target_idx);
+        let final_target_id = if accepted {
+            Some(consensuses[*merged_into.get(query_idx).unwrap_or(target_idx)].id)
+        } else {
+            None
+        };
+        let reason = if accepted {
+            "alignment_depth_criteria"
+        } else if depth_eligible {
+            "higher_depth_target_selected"
+        } else {
+            "depth_threshold"
+        };
+        merge_audit_rows.lock().unwrap().push(Stage5MergeAuditRow {
+            query_id: consensuses[*query_idx].id,
+            target_id: consensuses[*target_idx].id,
+            final_target_id,
+            query_depth,
+            target_depth: *target_depth,
+            adjusted_errors: Some(*adjusted_errors),
+            relative_depth: Some(relative_depth),
+            threshold: Some(threshold),
+            snpmer_conflicts: 0,
+            decision: if accepted { "accepted" } else { "rejected" },
+            reason,
+        });
+    }
+
+    let consensus_index_by_id = consensuses
+        .iter()
+        .enumerate()
+        .map(|(index, consensus)| (consensus.id, index))
+        .collect::<HashMap<_, _>>();
+    let mut merge_audit_rows = merge_audit_rows.into_inner().unwrap();
+    for row in &mut merge_audit_rows {
+        if row.decision != "accepted" {
+            continue;
+        }
+        let Some(target_idx) = consensus_index_by_id.get(&row.target_id) else {
+            continue;
+        };
+        let final_target_idx = merged_into.get(target_idx).copied().unwrap_or(*target_idx);
+        row.final_target_id = Some(consensuses[final_target_idx].id);
+    }
+    merge_audit_rows.sort_by(|left, right| {
+        left.query_id
+            .cmp(&right.query_id)
+            .then_with(|| left.target_id.cmp(&right.target_id))
+            .then_with(|| left.decision.cmp(right.decision))
+            .then_with(|| left.reason.cmp(right.reason))
+    });
+    merge_audit_rows.dedup_by(|left, right| {
+        left.query_id == right.query_id
+            && left.target_id == right.target_id
+            && left.decision == right.decision
+            && left.reason == right.reason
+    });
+    let stage5_audit_path = temp_dir.join("stage5_merge_audit.tsv");
+    write_stage5_merge_audit(&merge_audit_rows, &stage5_audit_path)
+        .expect("Failed to write stage5_merge_audit.tsv");
+    log::info!(
+        "Wrote {} Stage 5 merge audit records to {}",
+        merge_audit_rows.len(),
+        stage5_audit_path.display(),
+    );
 
     // Perform the merges
     for (&query_idx, &target_idx) in &merged_into {
