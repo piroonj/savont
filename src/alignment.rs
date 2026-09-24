@@ -488,8 +488,9 @@ pub fn align_and_consensus(
         let largest_sequence_index = lengths_and_i[(lengths_and_i.len() as f64 * 0.9) as usize].1;
         let range = avg_qual_and_i[0..max_seqs_consensus.min(avg_qual_and_i.len())].iter().map(|(_, i)| *i);
 
-        // Create an aligner with appropriate preset
-        let aligner = Aligner::builder().map_ont().with_index_threads(args.threads).with_cigar().with_seq(&sequences[largest_sequence_index]).expect("Failed to create aligner");
+        // Rayon already parallelizes clusters, so do not create a second
+        // minimap2 thread pool for every cluster-level aligner.
+        let aligner = Aligner::builder().map_ont().with_index_threads(1).with_cigar().with_seq(&sequences[largest_sequence_index]).expect("Failed to create aligner");
         let mappings = Mutex::new(Vec::new());
 
         for i in range{
